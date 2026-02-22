@@ -31,6 +31,7 @@ add_library(mtmd
             models/qwen2vl.cpp
             models/qwen3vl.cpp
             models/siglip.cpp
+            models/step3vl.cpp
             models/whisper-enc.cpp
             models/deepseekocr.cpp
             models/mobilenetv5.cpp
