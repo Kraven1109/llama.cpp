@@ -28,6 +28,14 @@ export interface DatabaseMessageExtraImageFile {
 	base64Url: string;
 }
 
+export interface DatabaseMessageExtraVideoFile {
+	type: AttachmentType.VIDEO;
+	name: string;
+	base64Data: string;
+	mimeType: string;
+	uploadId?: string; // set when video was uploaded via streaming multipart (large files)
+}
+
 /**
  * Legacy format from old webui - pasted content was stored as "context" type
  * @deprecated Use DatabaseMessageExtraTextFile instead
@@ -73,6 +81,7 @@ export interface DatabaseMessageExtraMcpResource {
 
 export type DatabaseMessageExtra =
 	| DatabaseMessageExtraImageFile
+	| DatabaseMessageExtraVideoFile
 	| DatabaseMessageExtraTextFile
 	| DatabaseMessageExtraAudioFile
 	| DatabaseMessageExtraPdfFile

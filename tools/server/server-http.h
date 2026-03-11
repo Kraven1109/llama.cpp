@@ -5,6 +5,7 @@
 #include <map>
 #include <string>
 #include <thread>
+#include <vector>
 
 struct common_params;
 
@@ -73,6 +74,30 @@ struct server_http_context {
 
     void get(const std::string & path, const handler_t & handler) const;
     void post(const std::string & path, const handler_t & handler) const;
+
+    // Streaming multipart upload — files are streamed to disk (not buffered in memory)
+    struct uploaded_file {
+        std::string field_name;    // form field name (e.g. "video")
+        std::string filename;      // original filename from client
+        std::string content_type;  // MIME type
+        std::string tmp_path;      // path to temp file on disk
+        size_t      size = 0;      // bytes written
+    };
+
+    struct multipart_req {
+        std::map<std::string, std::string> params;
+        std::map<std::string, std::string> headers;
+        std::map<std::string, std::string> fields;  // text form fields
+        std::vector<uploaded_file> files;             // uploaded files (on disk)
+        std::string path;
+        std::string query_string;
+        std::function<bool()> is_closed;
+    };
+
+    using multipart_handler_t = std::function<server_http_res_ptr(const multipart_req & req)>;
+
+    // max_file_size: maximum bytes per file (0 = 2GB default)
+    void post_multipart(const std::string & path, const multipart_handler_t & handler, size_t max_file_size = 0) const;
 
     // for debugging
     std::string listening_address;

@@ -22,6 +22,9 @@ export interface ApiChatMessageContentPart {
 		data: string;
 		format: 'wav' | 'mp3';
 	};
+	video_url?: {
+		url: string;
+	};
 }
 
 export interface ApiContextSizeError {

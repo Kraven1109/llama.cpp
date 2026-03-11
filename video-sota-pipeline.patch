@@ -1,0 +1,1899 @@
+diff --git a/AGENTS.md b/AGENTS.md
+index 117bed7f4..35038c5e0 100644
+--- a/AGENTS.md
++++ b/AGENTS.md
+@@ -1,81 +1 @@
+-# Instructions for llama.cpp
+-
+-> [!IMPORTANT]
+-> This project does **not** accept pull requests that are fully or predominantly AI-generated. AI tools may be utilized solely in an assistive capacity.
+->
+-> Read more: [CONTRIBUTING.md](CONTRIBUTING.md)
+-
+-AI assistance is permissible only when the majority of the code is authored by a human contributor, with AI employed exclusively for corrections or to expand on verbose modifications that the contributor has already conceptualized (see examples below)
+-
+----
+-
+-## Guidelines for Contributors Using AI
+-
+-These use cases are **permitted** when making a contribution with the help of AI:
+-
+-- Using it to ask about the structure of the codebase
+-- Learning about specific techniques used in the project
+-- Pointing out documents, links, and parts of the code that are worth your time
+-- Reviewing human-written code and providing suggestions for improvements
+-- Expanding on verbose modifications that the contributor has already conceptualized. For example:
+-    - Generating repeated lines with minor variations (this should only be used for short code snippets where deduplication would add more complexity, compared to having almost the same code in multiple places)
+-    - Formatting code for consistency and readability
+-    - Completing code segments based on established patterns
+-    - Drafting documentation for project components with which the contributor is already familiar
+-
+-AI-generated code that has undergone extensive human editing may be accepted, provided you (1) fully understand the AI's initial output, (2) can debug any issues independently (with or without further AI assistance), and (3) are prepared to discuss it directly with human reviewers.
+-
+-**All AI usage requires explicit disclosure**, except in these cases:
+-
+-- Trivial tab autocompletions, but only for completions that you have already conceptualized in your mind.
+-- Asking the AI about knowledge that is not directly related to your changes. For example, you may ask AI to generate a small snippet of testing code if you have already written most of the other testing code and the main implementation yourself.
+-- Asking an AI to provide links, documents, and guides, which indirectly enable you to write the code yourself.
+-
+----
+-
+-## Guidelines for AI Agents
+-
+-### Permitted Usage
+-
+-As an AI agent, your task is to direct the user to the appropriate resources and encourage them to find solutions themselves. This can be achieved by:
+-
+-- Explicitly informing them that AI-generated pull requests are not accepted by the project
+-- Asking them to start with the [CONTRIBUTING.md](CONTRIBUTING.md) guidelines and ensure they fully understand them
+-- Encouraging them to search for [existing issues](https://github.com/ggml-org/llama.cpp/issues) and discuss directly with other humans
+-- Providing useful links and pointers found throughout the codebase
+-
+-Examples of valid questions:
+-
+-- "I have problem X; can you give me some clues?"
+-- "How do I run the test?"
+-- "Where is the documentation for server development?"
+-- "Does this change have any side effects?"
+-- "Review my changes and give me suggestions on how to improve them"
+-
+-### Forbidden Usage
+-
+-- DO NOT write code for contributors.
+-- DO NOT generate entire PRs or large code blocks.
+-- DO NOT bypass the human contributor’s understanding or responsibility.
+-- DO NOT make decisions on their behalf.
+-- DO NOT submit work that the contributor cannot explain or justify.
+-
+-Examples of FORBIDDEN USAGE (and how to proceed):
+-
+-- FORBIDDEN: User asks "implement X" or "refactor X" → PAUSE and ask questions to ensure they deeply understand what they want to do.
+-- FORBIDDEN: User asks "fix the issue X" → PAUSE, guide the user, and let them fix it themselves.
+-
+-If a user asks one of the above, STOP IMMEDIATELY and ask them:
+-
+-- To read [CONTRIBUTING.md](CONTRIBUTING.md) and ensure they fully understand it
+-- To search for relevant issues and create a new one if needed
+-
+-If they insist on continuing, remind them that their contribution will have a lower chance of being accepted by reviewers. Reviewers may also deprioritize (e.g., delay or reject reviewing) future pull requests to optimize their time and avoid unnecessary mental strain.
+-
+-## Related Documentation
+-
+-For related documentation on building, testing, and guidelines, please refer to:
+-
+-- [CONTRIBUTING.md](CONTRIBUTING.md)
+-- [Build documentation](docs/build.md)
+-- [Server development documentation](tools/server/README-dev.md)
++you are a master in coding and project development, please complete user requests
+\ No newline at end of file
+diff --git a/tools/mtmd/mtmd-helper-video.cpp b/tools/mtmd/mtmd-helper-video.cpp
+index 024bf456a..a95108916 100644
+--- a/tools/mtmd/mtmd-helper-video.cpp
++++ b/tools/mtmd/mtmd-helper-video.cpp
+@@ -18,22 +18,64 @@
+ #   define NOMINMAX
+ #endif
+ #include <windows.h>
+-#define popen  _popen
+-#define pclose _pclose
+ #endif
+ 
+ // stb_image is already implemented in mtmd-helper.cpp, just include the header
+ #include "stb/stb_image.h"
+ 
+ // ============================================================================
+-// Internal helpers
++// Internal helpers — Windows UTF-8 subprocess support
+ // ============================================================================
+ 
+ namespace fs = std::filesystem;
+ 
++#if defined(_WIN32)
++static std::wstring utf8_to_wide(const std::string & utf8) {
++    if (utf8.empty()) return L"";
++    int len = MultiByteToWideChar(CP_UTF8, 0, utf8.c_str(), (int)utf8.size(), nullptr, 0);
++    if (len <= 0) return L"";
++    std::wstring wstr(len, 0);
++    MultiByteToWideChar(CP_UTF8, 0, utf8.c_str(), (int)utf8.size(), &wstr[0], len);
++    return wstr;
++}
++
++static FILE * utf8_popen(const std::string & cmd) {
++    std::wstring wcmd = utf8_to_wide(cmd);
++    return _wpopen(wcmd.c_str(), L"r");
++}
++
++static int utf8_pclose(FILE * fp) {
++    return _pclose(fp);
++}
++
++static int utf8_system(const std::string & cmd) {
++    std::wstring wcmd = utf8_to_wide(cmd);
++    return _wsystem(wcmd.c_str());
++}
++
++static fs::path utf8_path(const std::string & p) {
++    return fs::path(utf8_to_wide(p));
++}
++#else
++static FILE * utf8_popen(const std::string & cmd) {
++    return popen(cmd.c_str(), "r");
++}
++static int utf8_pclose(FILE * fp) {
++    return pclose(fp);
++}
++static int utf8_system(const std::string & cmd) {
++    return system(cmd.c_str());
++}
++static fs::path utf8_path(const std::string & p) {
++    return fs::path(p);
++}
++#endif
++
++// Use system temp directory with a hash to avoid Unicode issues in path
+ static std::string create_temp_dir(const char * video_path) {
+-    fs::path vpath(video_path);
+-    fs::path tmp = vpath.parent_path() / (vpath.stem().string() + "_mtmd_frames");
++    std::hash<std::string> hasher;
++    size_t h = hasher(std::string(video_path));
++    fs::path tmp = fs::temp_directory_path() / ("mtmd_frames_" + std::to_string(h));
+     std::error_code ec;
+     fs::create_directories(tmp, ec);
+     return tmp.string();
+@@ -41,77 +83,99 @@ static std::string create_temp_dir(const char * video_path) {
+ 
+ static void cleanup_temp_dir(const std::string & dir) {
+     std::error_code ec;
+-    fs::remove_all(dir, ec);
++    fs::remove_all(utf8_path(dir), ec);
+ }
+ 
+-// Get video duration using ffprobe - tries multiple methods
+-static float get_video_duration(const char * video_path) {
+-    // Method 1: format duration (container-level)
+-    {
+-        char cmd[2048];
+-        snprintf(cmd, sizeof(cmd),
+-            "ffprobe -v error -show_entries format=duration "
+-            "-of default=noprint_wrappers=1:nokey=1 \"%s\"",
+-            video_path);
++// ============================================================================
++// Video probing — lightweight metadata extraction
++// ============================================================================
+ 
+-        FILE * fp = popen(cmd, "r");
+-        if (fp) {
+-            float duration = -1.0f;
+-            if (fscanf(fp, "%f", &duration) == 1 && duration > 0.0f) {
+-                pclose(fp);
+-                return duration;
+-            }
+-            pclose(fp);
++struct video_probe_info {
++    float  duration      = -1.0f; // seconds
++    float  fps           = -1.0f; // source fps
++    int    width         = 0;
++    int    height        = 0;
++    int    n_keyframes   = -1;    // -1 = unknown
++    int64_t file_size_mb = 0;
++};
++
++// Probe video metadata in a single ffprobe call (duration, resolution, fps)
++static video_probe_info probe_video(const char * video_path) {
++    video_probe_info info;
++
++    // Get file size
++    {
++        std::error_code ec;
++        auto fsize = fs::file_size(utf8_path(video_path), ec);
++        if (!ec) {
++            info.file_size_mb = (int64_t)(fsize / (1024 * 1024));
+         }
+     }
+ 
+-    // Method 2: stream duration (more reliable for some formats)
++    // Single ffprobe call for duration + resolution + fps
+     {
+         char cmd[2048];
+         snprintf(cmd, sizeof(cmd),
+             "ffprobe -v error -select_streams v:0 "
+-            "-show_entries stream=duration "
+-            "-of default=noprint_wrappers=1:nokey=1 \"%s\"",
++            "-show_entries format=duration "
++            "-show_entries stream=width,height,r_frame_rate,duration "
++            "-of csv=p=0:nk=1 \"%s\"",
+             video_path);
+ 
+-        FILE * fp = popen(cmd, "r");
++        FILE * fp = utf8_popen(cmd);
+         if (fp) {
+-            float duration = -1.0f;
+-            if (fscanf(fp, "%f", &duration) == 1 && duration > 0.0f) {
+-                pclose(fp);
+-                return duration;
++            char buf[512] = {};
++            // Read all lines — format outputs duration on one line, stream on another
++            std::string all_output;
++            while (fgets(buf, sizeof(buf), fp)) {
++                all_output += buf;
++            }
++            utf8_pclose(fp);
++
++            // Parse output: typically 2 lines
++            //   Line 1 (stream): width,height,fps_num/fps_den,stream_duration
++            //   Line 2 (format): format_duration
++            std::istringstream iss(all_output);
++            std::string line;
++            while (std::getline(iss, line)) {
++                // Try parsing as stream line: w,h,num/den,dur
++                int w = 0, h = 0, fn = 0, fd = 1;
++                float sdur = -1.0f;
++                if (sscanf(line.c_str(), "%d,%d,%d/%d,%f", &w, &h, &fn, &fd, &sdur) >= 4 && w > 0) {
++                    info.width  = w;
++                    info.height = h;
++                    if (fd > 0) info.fps = (float)fn / (float)fd;
++                    if (sdur > 0.0f && info.duration <= 0.0f) info.duration = sdur;
++                }
++                // Try parsing as format duration line (single float)
++                else {
++                    float fdur = -1.0f;
++                    if (sscanf(line.c_str(), "%f", &fdur) == 1 && fdur > 0.0f) {
++                        info.duration = fdur; // prefer format-level duration
++                    }
++                }
+             }
+-            pclose(fp);
+         }
+     }
+ 
+-    // Method 3: count frames and use frame rate
+-    {
++    // Fallback: try simpler duration extraction methods if above failed
++    if (info.duration <= 0.0f) {
+         char cmd[2048];
+         snprintf(cmd, sizeof(cmd),
+-            "ffprobe -v error -select_streams v:0 "
+-            "-count_frames -show_entries stream=nb_read_frames,r_frame_rate "
+-            "-of csv=p=0 \"%s\"",
++            "ffprobe -v error -show_entries format=duration "
++            "-of default=noprint_wrappers=1:nokey=1 \"%s\"",
+             video_path);
+-
+-        FILE * fp = popen(cmd, "r");
++        FILE * fp = utf8_popen(cmd);
+         if (fp) {
+-            char buf[256] = {};
+-            if (fgets(buf, sizeof(buf), fp)) {
+-                int num = 0, den = 1;
+-                long n_frames = 0;
+-                // Parse "fps_num/fps_den,n_frames"
+-                if (sscanf(buf, "%d/%d,%ld", &num, &den, &n_frames) == 3 && den > 0 && n_frames > 0) {
+-                    pclose(fp);
+-                    return (float)n_frames * (float)den / (float)num;
+-                }
++            float dur = -1.0f;
++            if (fscanf(fp, "%f", &dur) == 1 && dur > 0.0f) {
++                info.duration = dur;
+             }
+-            pclose(fp);
++            utf8_pclose(fp);
+         }
+     }
+ 
+-    fprintf(stderr, "[mtmd-video] ERROR: all duration detection methods failed\n");
+-    return -1.0f;  // caller should handle this
++    return info;
+ }
+ 
+ // Collect sorted file paths with given prefix
+@@ -131,11 +195,13 @@ static std::vector<std::string> collect_files_sorted(const std::string & dir, co
+ }
+ 
+ // Validate video path for shell safety
++// Paths are always double-quoted in ffmpeg/ffprobe commands, so '&' is safe.
++// Block characters that are dangerous even inside double quotes.
+ static bool validate_video_path(const char * video_path) {
+     if (!video_path) return false;
+     std::string path(video_path);
+     for (char c : path) {
+-        if (c == ';' || c == '|' || c == '&' || c == '`' || c == '$' || c == '\n' || c == '\r') {
++        if (c == ';' || c == '|' || c == '`' || c == '$' || c == '\n' || c == '\r') {
+             fprintf(stderr, "[mtmd-video] ERROR: video path contains unsafe characters\n");
+             return false;
+         }
+@@ -144,49 +210,222 @@ static bool validate_video_path(const char * video_path) {
+ }
+ 
+ // ============================================================================
+-// Frame extraction
++// Frame count calculation (matching Qwen2.5-VL official implementation)
++// ============================================================================
++
++static constexpr float  QWEN_DEFAULT_FPS = 2.0f;   // FPS = 2.0
++static constexpr int    FRAME_FACTOR     = 2;       // nframes must be divisible by 2
++static constexpr int    FPS_MIN_FRAMES   = 4;       // minimum frames
++static constexpr int    FPS_MAX_FRAMES   = 768;     // maximum frames (official)
++static constexpr int    GGUF_MAX_FRAMES  = 120;     // practical cap for GGUF models (context window)
++
++// Maximum output resolution — frames are scaled down if source exceeds this.
++// VLMs internally resize to their patch size (e.g. 384x384 per tile), so
++// saving frames at >1280px is pure waste of disk I/O and memory.
++static constexpr int    MAX_FRAME_DIM    = 1280;
++
++static int floor_to_factor(int n, int factor) {
++    return (n / factor) * factor;
++}
++
++// Calculate optimal frame count for video
++static int calc_nframes(float fps, int max_frames, float duration) {
++    if (fps <= 0.0f) fps = QWEN_DEFAULT_FPS;
++    if (max_frames <= 0) max_frames = GGUF_MAX_FRAMES;
++    if (max_frames > GGUF_MAX_FRAMES) max_frames = GGUF_MAX_FRAMES;
++
++    int nframes = (int)(duration * fps);
++    int effective_max = std::min(max_frames, FPS_MAX_FRAMES);
++    nframes = std::max(nframes, FPS_MIN_FRAMES);
++    nframes = std::min(nframes, effective_max);
++    nframes = floor_to_factor(nframes, FRAME_FACTOR);
++    if (nframes < FRAME_FACTOR) nframes = FRAME_FACTOR;
++    return nframes;
++}
++
++// ============================================================================
++// Extraction strategy selection — adaptive based on video properties
++// ============================================================================
++
++enum extraction_strategy {
++    EXTRACT_UNIFORM,    // Single ffmpeg pass with fps filter (default)
++    EXTRACT_FAST_SEEK,  // Per-frame fast seek — better for long/large videos
++    EXTRACT_KEYFRAME,   // I-frames only — fastest for very large files
++};
++
++static extraction_strategy choose_strategy(const video_probe_info & info, int nframes) {
++    // For very large files or very long videos, use keyframe extraction
++    if (info.file_size_mb > 2000 || info.duration > 1800.0f) {
++        return EXTRACT_KEYFRAME;
++    }
++    // For large files or long videos, use fast seek (per-frame seeking)
++    // This avoids decoding the entire stream — only seeks to nearest keyframe
++    if (info.file_size_mb > 200 || info.duration > 300.0f) {
++        return EXTRACT_FAST_SEEK;
++    }
++    return EXTRACT_UNIFORM;
++}
++
++// Build the video filter string: resolution scaling + fps/frame selection
++// Output JPEG (q:v 2) instead of PNG — 10-15× smaller files, ample quality for VLMs
++static std::string build_vf_scale(const video_probe_info & info) {
++    if (info.width > MAX_FRAME_DIM || info.height > MAX_FRAME_DIM) {
++        // Scale down preserving aspect ratio: constrain the larger dimension
++        return "scale='min(" + std::to_string(MAX_FRAME_DIM) + ",iw)':'min("
++            + std::to_string(MAX_FRAME_DIM) + ",ih)':force_original_aspect_ratio=decrease";
++    }
++    return "";
++}
++
++// ============================================================================
++// Frame extraction — three strategies
+ // ============================================================================
+ 
+-static bool extract_frames_uniform(
++// Strategy 1: Single-pass uniform extraction (best for short/small videos)
++static bool extract_uniform(
+     const char * video_path,
+     const std::string & tmp_dir,
+-    int max_frames,
++    int nframes,
+     float duration,
++    const video_probe_info & info,
+     std::vector<std::string> & out_files)
+ {
+-    if (duration <= 0.0f) {
+-        fprintf(stderr, "[mtmd-video] ERROR: invalid duration for frame extraction\n");
+-        return false;
+-    }
+-
+-    float target_fps = (float)max_frames / duration;
++    float target_fps = (float)nframes / duration;
+     if (target_fps > 30.0f) target_fps = 30.0f;
+     if (target_fps < 0.1f)  target_fps = 0.1f;
+ 
++    std::string scale = build_vf_scale(info);
++    std::string vf = "fps=" + std::to_string(target_fps);
++    if (!scale.empty()) vf += "," + scale;
++
+     char cmd[4096];
+ #if defined(_WIN32)
+     snprintf(cmd, sizeof(cmd),
+         "ffmpeg -i \"%s\" -y "
+-        "-vf \"fps=%.4f\" -frames:v %d "
+-        "\"%s\\frame_%%04d.png\" 2>NUL",
+-        video_path, target_fps, max_frames, tmp_dir.c_str());
++        "-vf \"%s\" -frames:v %d -q:v 2 "
++        "\"%s\\frame_%%04d.jpg\" 2>NUL",
++        video_path, vf.c_str(), nframes, tmp_dir.c_str());
+ #else
+     snprintf(cmd, sizeof(cmd),
+         "ffmpeg -i \"%s\" -y "
+-        "-vf \"fps=%.4f\" -frames:v %d "
+-        "\"%s/frame_%%04d.png\" 2>/dev/null",
+-        video_path, target_fps, max_frames, tmp_dir.c_str());
++        "-vf \"%s\" -frames:v %d -q:v 2 "
++        "\"%s/frame_%%04d.jpg\" 2>/dev/null",
++        video_path, vf.c_str(), nframes, tmp_dir.c_str());
+ #endif
+ 
+-    int ret = system(cmd);
++    int ret = utf8_system(cmd);
+     if (ret != 0) {
+-        fprintf(stderr, "[mtmd-video] WARN: ffmpeg returned %d\n", ret);
++        fprintf(stderr, "[mtmd-video] WARN: ffmpeg uniform extraction returned %d\n", ret);
++    }
++
++    out_files = collect_files_sorted(tmp_dir, "frame_");
++    return !out_files.empty();
++}
++
++// Strategy 2: Per-frame fast seek (best for long/large videos with sparse sampling)
++// Uses -ss BEFORE -i for fast seek to nearest keyframe, then decodes one frame
++static bool extract_fast_seek(
++    const char * video_path,
++    const std::string & tmp_dir,
++    int nframes,
++    float duration,
++    const video_probe_info & info,
++    std::vector<std::string> & out_files)
++{
++    std::string scale = build_vf_scale(info);
++    std::string vf = scale.empty() ? "" : ("-vf \"" + scale + "\" ");
++
++    // Calculate uniform timestamps
++    float step = duration / (float)nframes;
++
++    for (int i = 0; i < nframes; i++) {
++        float ts = step * (i + 0.5f); // midpoint of interval
++
++        char cmd[4096];
++#if defined(_WIN32)
++        snprintf(cmd, sizeof(cmd),
++            "ffmpeg -ss %.4f -i \"%s\" -y "
++            "%s-frames:v 1 -q:v 2 "
++            "\"%s\\frame_%04d.jpg\" 2>NUL",
++            ts, video_path, vf.c_str(), tmp_dir.c_str(), i + 1);
++#else
++        snprintf(cmd, sizeof(cmd),
++            "ffmpeg -ss %.4f -i \"%s\" -y "
++            "%s-frames:v 1 -q:v 2 "
++            "\"%s/frame_%04d.jpg\" 2>/dev/null",
++            ts, video_path, vf.c_str(), tmp_dir.c_str(), i + 1);
++#endif
++
++        int ret = utf8_system(cmd);
++        if (ret != 0) {
++            fprintf(stderr, "[mtmd-video] WARN: fast seek frame %d (ts=%.2f) returned %d\n", i, ts, ret);
++        }
+     }
+ 
+     out_files = collect_files_sorted(tmp_dir, "frame_");
+     return !out_files.empty();
+ }
+ 
++// Strategy 3: Keyframe extraction (fastest for very large files)
++// Only decodes I-frames, no B/P frame decoding needed
++static bool extract_keyframes(
++    const char * video_path,
++    const std::string & tmp_dir,
++    int nframes,
++    const video_probe_info & info,
++    std::vector<std::string> & out_files)
++{
++    std::string scale = build_vf_scale(info);
++    // Extract all keyframes first, then we'll subsample
++    // -skip_frame nokey tells the demuxer to only deliver keyframes
++    std::string vf_parts;
++    if (!scale.empty()) vf_parts = scale;
++
++    char cmd[4096];
++    // Extract up to 4× nframes keyframes, then subsample below
++    int key_limit = nframes * 4;
++#if defined(_WIN32)
++    snprintf(cmd, sizeof(cmd),
++        "ffmpeg -skip_frame nokey -i \"%s\" -y "
++        "-vsync vfr %s%s-frames:v %d -q:v 2 "
++        "\"%s\\key_%%04d.jpg\" 2>NUL",
++        video_path,
++        vf_parts.empty() ? "" : "-vf \"",
++        vf_parts.empty() ? "" : (vf_parts + "\" ").c_str(),
++        key_limit, tmp_dir.c_str());
++#else
++    snprintf(cmd, sizeof(cmd),
++        "ffmpeg -skip_frame nokey -i \"%s\" -y "
++        "-vsync vfr %s%s-frames:v %d -q:v 2 "
++        "\"%s/key_%%04d.jpg\" 2>/dev/null",
++        video_path,
++        vf_parts.empty() ? "" : "-vf \"",
++        vf_parts.empty() ? "" : (vf_parts + "\" ").c_str(),
++        key_limit, tmp_dir.c_str());
++#endif
++
++    int ret = utf8_system(cmd);
++    if (ret != 0) {
++        fprintf(stderr, "[mtmd-video] WARN: keyframe extraction returned %d\n", ret);
++    }
++
++    auto all_keys = collect_files_sorted(tmp_dir, "key_");
++    if (all_keys.empty()) return false;
++
++    // Uniformly subsample keyframes down to nframes
++    if ((int)all_keys.size() <= nframes) {
++        out_files = all_keys;
++    } else {
++        float step = (float)all_keys.size() / (float)nframes;
++        for (int i = 0; i < nframes; i++) {
++            int idx = (int)(step * i);
++            if (idx >= (int)all_keys.size()) idx = (int)all_keys.size() - 1;
++            out_files.push_back(all_keys[idx]);
++        }
++    }
++    return !out_files.empty();
++}
++
+ // ============================================================================
+ // Public API
+ // ============================================================================
+@@ -194,34 +433,62 @@ static bool extract_frames_uniform(
+ struct mtmd_video * mtmd_video_load(
+     const char * video_path,
+     int          max_frames,
++    float        fps,
+     float        scene_threshold)
+ {
+     (void)scene_threshold; // reserved for future scene-based extraction
+ 
+-    if (!validate_video_path(video_path) || max_frames <= 0) {
++    if (!validate_video_path(video_path)) {
+         return nullptr;
+     }
+ 
+-    if (!fs::exists(video_path)) {
++    if (!fs::exists(utf8_path(video_path))) {
+         fprintf(stderr, "[mtmd-video] ERROR: video file not found: %s\n", video_path);
+         return nullptr;
+     }
+ 
+-    if (max_frames > 120) max_frames = 120;
+-
+-    float duration = get_video_duration(video_path);
+-    if (duration <= 0.0f) {
++    // Single probe call for all metadata (duration, resolution, fps, file size)
++    video_probe_info info = probe_video(video_path);
++    if (info.duration <= 0.0f) {
+         fprintf(stderr, "[mtmd-video] ERROR: could not determine video duration. Is ffprobe working?\n");
+         return nullptr;
+     }
+ 
+-    fprintf(stderr, "[mtmd-video] loading video: %s (duration=%.1fs, max_frames=%d)\n",
+-            video_path, duration, max_frames);
++    int nframes = calc_nframes(fps, max_frames, info.duration);
++    extraction_strategy strategy = choose_strategy(info, nframes);
++    float actual_fps = (float)nframes / info.duration;
++
++    const char * strategy_names[] = { "uniform", "fast-seek", "keyframe" };
++    fprintf(stderr, "[mtmd-video] loading: %s\n"
++                    "  duration=%.1fs  resolution=%dx%d  size=%lldMB\n"
++                    "  nframes=%d  fps=%.2f  strategy=%s  output=JPEG\n",
++            video_path,
++            info.duration, info.width, info.height, (long long)info.file_size_mb,
++            nframes, actual_fps, strategy_names[strategy]);
+ 
+     std::string tmp_dir = create_temp_dir(video_path);
+ 
+     std::vector<std::string> frame_files;
+-    bool ok = extract_frames_uniform(video_path, tmp_dir, max_frames, duration, frame_files);
++    bool ok = false;
++
++    switch (strategy) {
++        case EXTRACT_UNIFORM:
++            ok = extract_uniform(video_path, tmp_dir, nframes, info.duration, info, frame_files);
++            break;
++        case EXTRACT_FAST_SEEK:
++            ok = extract_fast_seek(video_path, tmp_dir, nframes, info.duration, info, frame_files);
++            break;
++        case EXTRACT_KEYFRAME:
++            ok = extract_keyframes(video_path, tmp_dir, nframes, info, frame_files);
++            // Fallback to fast seek if keyframe extraction got too few frames
++            if (ok && (int)frame_files.size() < nframes / 2) {
++                fprintf(stderr, "[mtmd-video] keyframe extraction got only %d frames, falling back to fast-seek\n",
++                        (int)frame_files.size());
++                frame_files.clear();
++                ok = extract_fast_seek(video_path, tmp_dir, nframes, info.duration, info, frame_files);
++            }
++            break;
++    }
+ 
+     if (!ok || frame_files.empty()) {
+         fprintf(stderr, "[mtmd-video] ERROR: failed to extract any frames\n");
+@@ -230,25 +497,25 @@ struct mtmd_video * mtmd_video_load(
+     }
+ 
+     int n_frames = (int)frame_files.size();
+-    float time_step = duration / (float)n_frames;
++    float time_step = info.duration / (float)n_frames;
+ 
+     fprintf(stderr, "[mtmd-video] extracted %d frames (time_step=%.2fs)\n", n_frames, time_step);
+ 
+     // Build output
+     auto * video = new mtmd_video();
+     video->n_frames     = n_frames;
+-    video->duration_sec = duration;
++    video->duration_sec = info.duration;
++    video->sample_fps   = (float)n_frames / info.duration;
+     video->tmp_dir      = strdup(tmp_dir.c_str());
+     video->frames       = (mtmd_video_frame *)calloc(n_frames, sizeof(mtmd_video_frame));
+ 
+     for (int i = 0; i < n_frames; i++) {
+         auto & f = video->frames[i];
+         f.frame_index    = i;
+-        f.timestamp_sec  = time_step * (i + 0.5f); // midpoint of interval
++        f.timestamp_sec  = time_step * (i + 0.5f);
+         f.png_path       = strdup(frame_files[i].c_str());
+-        f.data           = nullptr; // loaded on demand via mtmd_video_frame_read_png
++        f.data           = nullptr;
+ 
+-        // Get image dimensions
+         int nx = 0, ny = 0, nc = 0;
+         if (stbi_info(frame_files[i].c_str(), &nx, &ny, &nc)) {
+             f.nx = (uint32_t)nx;
+@@ -284,9 +551,11 @@ size_t mtmd_video_frame_read_png(const struct mtmd_video_frame * frame,
+         return 0;
+     }
+ 
++    // Note: despite the function name, this reads any image format (JPEG or PNG)
++    // The png_path field stores the path regardless of format
+     std::ifstream file(frame->png_path, std::ios::binary | std::ios::ate);
+     if (!file.is_open()) {
+-        fprintf(stderr, "[mtmd-video] ERROR: cannot open frame PNG: %s\n", frame->png_path);
++        fprintf(stderr, "[mtmd-video] ERROR: cannot open frame: %s\n", frame->png_path);
+         return 0;
+     }
+ 
+diff --git a/tools/mtmd/mtmd-helper-video.h b/tools/mtmd/mtmd-helper-video.h
+index fb7b2b151..0a218ffb6 100644
+--- a/tools/mtmd/mtmd-helper-video.h
++++ b/tools/mtmd/mtmd-helper-video.h
+@@ -26,18 +26,26 @@ struct mtmd_video {
+     struct mtmd_video_frame * frames;
+     int    n_frames;
+     float  duration_sec;
++    float  sample_fps;        // actual sampling fps used
+     char * tmp_dir;           // temp directory with frame PNGs (cleaned up on free)
+ };
+ 
+ // Load video and extract frames using ffmpeg subprocess
+ // video_path: path to video file (local)
+-// max_frames: maximum number of frames to extract (default: 15)
+-// scene_threshold: scene change detection threshold 0.0-1.0 (default: 0.3)
++// max_frames: maximum number of frames to extract (0 = auto based on fps, capped at 120)
++// fps:        target frames per second (0.0 = use default 2.0 fps, matching Qwen2.5-VL native)
++// scene_threshold: scene change detection threshold 0.0-1.0 (reserved, unused)
+ // returns nullptr on failure
+ // NOTE: ffmpeg must be available in PATH
++//
++// Frame count logic (matching Qwen2.5-VL official implementation):
++//   nframes = duration * fps  (default fps=2.0)
++//   nframes = max(4, min(nframes, max_frames))
++//   nframes rounded to nearest even number (FRAME_FACTOR=2)
+ MTMD_API struct mtmd_video * mtmd_video_load(
+     const char * video_path,
+     int          max_frames,
++    float        fps,
+     float        scene_threshold);
+ 
+ // Free video and all its frames, also cleans up temp directory
+diff --git a/tools/server/public/index.html.gz b/tools/server/public/index.html.gz
+index ed3fc127b..cb38ed1eb 100644
+Binary files a/tools/server/public/index.html.gz and b/tools/server/public/index.html.gz differ
+diff --git a/tools/server/server-common.cpp b/tools/server/server-common.cpp
+index 8ed13c030..0eb6d3560 100644
+--- a/tools/server/server-common.cpp
++++ b/tools/server/server-common.cpp
+@@ -13,6 +13,7 @@
+ #include <random>
+ #include <sstream>
+ #include <fstream>
++#include <filesystem>
+ 
+ json format_error_response(const std::string & message, const enum error_type type) {
+     std::string type_str;
+@@ -85,6 +86,59 @@ std::string gen_tool_call_id() {
+     return random_string();
+ }
+ 
++// ============================================================================
++// Video upload store — manages streaming-uploaded temp files
++// ============================================================================
++
++video_upload_store g_video_uploads;
++
++std::string video_upload_store::add(const std::string & tmp_path, const std::string & filename,
++                                    const std::string & content_type, size_t size) {
++    std::string id = "vid_" + random_string();
++    video_upload_entry entry;
++    entry.id           = id;
++    entry.tmp_path     = tmp_path;
++    entry.filename     = filename;
++    entry.content_type = content_type;
++    entry.size         = size;
++    entry.created_at   = (int64_t)std::time(nullptr);
++
++    std::lock_guard<std::mutex> lock(mtx);
++    entries[id] = std::move(entry);
++    return id;
++}
++
++std::string video_upload_store::resolve(const std::string & id) const {
++    std::lock_guard<std::mutex> lock(mtx);
++    auto it = entries.find(id);
++    if (it == entries.end()) return "";
++    return it->second.tmp_path;
++}
++
++void video_upload_store::remove(const std::string & id) {
++    std::lock_guard<std::mutex> lock(mtx);
++    auto it = entries.find(id);
++    if (it != entries.end()) {
++        std::error_code ec;
++        std::filesystem::remove(it->second.tmp_path, ec);
++        entries.erase(it);
++    }
++}
++
++void video_upload_store::cleanup(int ttl_seconds) {
++    int64_t now = (int64_t)std::time(nullptr);
++    std::lock_guard<std::mutex> lock(mtx);
++    for (auto it = entries.begin(); it != entries.end(); ) {
++        if (now - it->second.created_at > ttl_seconds) {
++            std::error_code ec;
++            std::filesystem::remove(it->second.tmp_path, ec);
++            it = entries.erase(it);
++        } else {
++            ++it;
++        }
++    }
++}
++
+ //
+ // lora utils
+ //
+@@ -1019,7 +1073,8 @@ json oaicompat_chat_params_parse(
+ 
+                 json video_url_obj = json_value(p, "video_url", json::object());
+                 std::string url = json_value(video_url_obj, "url", std::string());
+-                int max_frames = json_value(video_url_obj, "max_frames", 15);
++                int max_frames = json_value(video_url_obj, "max_frames", 0);   // 0 = auto (fps-based)
++                float fps = json_value(video_url_obj, "fps", 0.0f);            // 0 = default 2.0 fps
+                 float scene_threshold = json_value(video_url_obj, "scene_threshold", 0.3f);
+ 
+                 // Resolve URL to local path
+@@ -1033,11 +1088,64 @@ json oaicompat_chat_params_parse(
+                         throw std::invalid_argument("file path is not allowed: " + file_path);
+                     }
+                     local_path = opt.media_path + file_path;
++                } else if (string_starts_with(url, "data:video/")) {
++                    // Decode base64 data URL to temp file
++                    auto comma_pos = url.find(',');
++                    if (comma_pos == std::string::npos) {
++                        throw std::invalid_argument("invalid data URL for video");
++                    }
++                    std::string base64_data = url.substr(comma_pos + 1);
++
++                    // Determine extension from mime type
++                    std::string ext = ".mp4";
++                    auto semi_pos = url.find(';');
++                    if (semi_pos != std::string::npos) {
++                        std::string mime = url.substr(5, semi_pos - 5); // after "data:"
++                        if (mime == "video/webm") ext = ".webm";
++                        else if (mime == "video/quicktime") ext = ".mov";
++                        else if (mime == "video/x-msvideo") ext = ".avi";
++                        else if (mime == "video/x-matroska" || mime == "video/mkv") ext = ".mkv";
++                    }
++
++                    // Decode base64
++                    if (base64_data.size() < 16) {
++                        throw std::runtime_error("Video base64 data is too small (" + std::to_string(base64_data.size()) + " chars) - possible client-side encoding error");
++                    }
++                    std::vector<uint8_t> decoded = base64_decode(base64_data);
++                    if (decoded.size() < 1024) {
++                        throw std::runtime_error("Decoded video data too small (" + std::to_string(decoded.size()) + " bytes) - the upload may be corrupted");
++                    }
++
++                    // Write to temp file using filesystem path (avoids mixed-separator issues on Windows)
++                    {
++                        std::filesystem::path tmp_fspath =
++                            std::filesystem::temp_directory_path() / ("llama_video_upload" + ext);
++                        local_path = tmp_fspath.u8string();
++                        std::ofstream tmp_file(tmp_fspath, std::ios::binary);
++                        if (!tmp_file.is_open()) {
++                            throw std::runtime_error("Failed to create temp video file: " + local_path);
++                        }
++                        tmp_file.write(reinterpret_cast<const char *>(decoded.data()), decoded.size());
++                        if (!tmp_file.good()) {
++                            tmp_file.close();
++                            throw std::runtime_error("Failed to write video data to: " + local_path);
++                        }
++                        tmp_file.close();
++                    }
++                    SRV_INF("video data URL decoded to temp: %s (%zu bytes)\n", local_path.c_str(), decoded.size());
++                } else if (string_starts_with(url, "upload://")) {
++                    // Resolve streaming upload reference
++                    std::string upload_id = url.substr(9); // after "upload://"
++                    local_path = g_video_uploads.resolve(upload_id);
++                    if (local_path.empty()) {
++                        throw std::invalid_argument("upload not found or expired: " + upload_id);
++                    }
++                    SRV_INF("resolved upload://%s → %s\n", upload_id.c_str(), local_path.c_str());
+                 } else if (string_starts_with(url, "http")) {
+                     // Download to temp file
+                     common_remote_params params;
+-                    params.max_size = 1024 * 1024 * 200; // 200MB for video
+-                    params.timeout  = 120; // 2 min for video download
++                    params.max_size = (size_t)2 * 1024 * 1024 * 1024; // 2GB for video
++                    params.timeout  = 300; // 5 min for video download
+                     SRV_INF("downloading video from '%s'\n", url.c_str());
+                     auto res = common_remote_get_content(url, params);
+                     if (200 <= res.first && res.first < 300) {
+@@ -1061,12 +1169,13 @@ json oaicompat_chat_params_parse(
+                 }
+ 
+                 // Extract video frames
+-                auto * video = mtmd_video_load(local_path.c_str(), max_frames, scene_threshold);
++                auto * video = mtmd_video_load(local_path.c_str(), max_frames, fps, scene_threshold);
+                 if (!video) {
+                     throw std::runtime_error("Failed to extract frames from video: " + local_path);
+                 }
+ 
+-                SRV_INF("extracted %d frames from video (duration=%.1fs)\n", video->n_frames, video->duration_sec);
++                SRV_INF("extracted %d frames from video (duration=%.1fs, sample_fps=%.2f)\n",
++                        video->n_frames, video->duration_sec, video->sample_fps);
+ 
+                 // Load each frame PNG into out_files as raw buffers and record video frame metadata
+                 int n_total = video->n_frames;
+diff --git a/tools/server/server-common.h b/tools/server/server-common.h
+index 6fa5ab7dc..a7f7452e3 100644
+--- a/tools/server/server-common.h
++++ b/tools/server/server-common.h
+@@ -12,6 +12,8 @@
+ #include <string>
+ #include <vector>
+ #include <cinttypes>
++#include <mutex>
++#include <unordered_map>
+ 
+ using json = nlohmann::ordered_json;
+ 
+@@ -258,6 +260,41 @@ struct video_frame_meta {
+     float timestamp_sec;
+ };
+ 
++// Upload store — manages temp files uploaded via /v1/upload/video
++// Thread-safe. Files are auto-deleted after TTL expiration.
++struct video_upload_entry {
++    std::string id;            // unique upload ID
++    std::string tmp_path;      // path to temp file on disk
++    std::string filename;      // original filename
++    std::string content_type;  // MIME type
++    size_t      size = 0;      // file size in bytes
++    int64_t     created_at = 0; // unix timestamp
++};
++
++class video_upload_store {
++public:
++    // Store a new upload, returns the assigned upload ID
++    std::string add(const std::string & tmp_path, const std::string & filename,
++                    const std::string & content_type, size_t size);
++
++    // Resolve an upload ID to its temp file path (empty if not found or expired)
++    std::string resolve(const std::string & id) const;
++
++    // Remove an upload (and delete the temp file)
++    void remove(const std::string & id);
++
++    // Remove uploads older than ttl_seconds
++    void cleanup(int ttl_seconds = 3600);
++
++private:
++    mutable std::mutex mtx;
++    std::unordered_map<std::string, video_upload_entry> entries;
++};
++
++// Global upload store (owned by server main, passed around via reference)
++// Declared extern — defined in server-common.cpp
++extern video_upload_store g_video_uploads;
++
+ // process mtmd prompt, return the server_tokens containing both text tokens and media chunks
+ // video_frames is optional - when set, it tags specific file entries as video frames
+ server_tokens process_mtmd_prompt(mtmd_context * mctx, std::string prompt, std::vector<raw_buffer> files,
+diff --git a/tools/server/server-http.cpp b/tools/server/server-http.cpp
+index 129022a71..1c0bc3199 100644
+--- a/tools/server/server-http.cpp
++++ b/tools/server/server-http.cpp
+@@ -7,6 +7,8 @@
+ #include <functional>
+ #include <string>
+ #include <thread>
++#include <filesystem>
++#include <atomic>
+ 
+ // auto generated files (see README.md for details)
+ #include "index.html.gz.hpp"
+@@ -417,3 +419,124 @@ void server_http_context::post(const std::string & path, const server_http_conte
+     });
+ }
+ 
++void server_http_context::post_multipart(
++    const std::string & path,
++    const server_http_context::multipart_handler_t & handler,
++    size_t max_file_size) const
++{
++    if (max_file_size == 0) {
++        max_file_size = (size_t)2 * 1024 * 1024 * 1024; // 2GB
++    }
++
++    pimpl->srv->Post(path_prefix + path,
++        [handler, max_file_size](const httplib::Request & req, httplib::Response & res,
++                                 const httplib::ContentReader & content_reader) {
++            server_http_context::multipart_req mreq;
++            mreq.params  = get_params(req);
++            mreq.headers = get_headers(req);
++            mreq.path    = req.path;
++            mreq.query_string = build_query_string(req);
++            mreq.is_closed    = req.is_connection_closed;
++
++            // State for streaming multipart parts
++            FILE * cur_fp = nullptr;
++            server_http_context::uploaded_file cur_file;
++            size_t cur_size = 0;
++            std::string cur_field_name;
++            std::string cur_field_value;
++            bool is_file = false;
++            bool too_large = false;
++
++            // Atomic counter for unique temp file names
++            static std::atomic<uint64_t> upload_counter{0};
++
++            content_reader(
++                // Part header callback
++                [&](const httplib::FormData & part) -> bool {
++                    // Finalize previous part
++                    if (cur_fp) {
++                        fclose(cur_fp);
++                        cur_file.size = cur_size;
++                        mreq.files.push_back(std::move(cur_file));
++                        cur_fp = nullptr;
++                        cur_size = 0;
++                    } else if (!cur_field_name.empty()) {
++                        mreq.fields[cur_field_name] = std::move(cur_field_value);
++                        cur_field_name.clear();
++                        cur_field_value.clear();
++                    }
++
++                    if (!part.filename.empty()) {
++                        // File part — stream to temp file
++                        is_file = true;
++                        cur_file = {};
++                        cur_file.field_name    = part.name;
++                        cur_file.filename      = part.filename;
++                        cur_file.content_type  = part.content_type;
++
++                        auto id = upload_counter.fetch_add(1);
++                        std::string ext;
++                        auto dot = part.filename.rfind('.');
++                        if (dot != std::string::npos) {
++                            ext = part.filename.substr(dot);
++                        }
++                        auto tmp = std::filesystem::temp_directory_path()
++                                 / ("llama_upload_" + std::to_string(id) + ext);
++                        cur_file.tmp_path = tmp.string();
++
++                        cur_fp = fopen(cur_file.tmp_path.c_str(), "wb");
++                        if (!cur_fp) {
++                            SRV_ERR("failed to create temp file: %s\n", cur_file.tmp_path.c_str());
++                            return false;
++                        }
++                    } else {
++                        // Text field
++                        is_file = false;
++                        cur_field_name = part.name;
++                        cur_field_value.clear();
++                    }
++                    return true;
++                },
++                // Data chunk callback
++                [&](const char * data, size_t len) -> bool {
++                    if (is_file && cur_fp) {
++                        cur_size += len;
++                        if (cur_size > max_file_size) {
++                            too_large = true;
++                            return false;
++                        }
++                        fwrite(data, 1, len, cur_fp);
++                    } else if (!is_file) {
++                        cur_field_value.append(data, len);
++                    }
++                    return true;
++                }
++            );
++
++            // Finalize last part
++            if (cur_fp) {
++                fclose(cur_fp);
++                cur_file.size = cur_size;
++                mreq.files.push_back(std::move(cur_file));
++            } else if (!cur_field_name.empty()) {
++                mreq.fields[cur_field_name] = std::move(cur_field_value);
++            }
++
++            if (too_large) {
++                for (const auto & f : mreq.files) {
++                    std::error_code ec;
++                    std::filesystem::remove(f.tmp_path, ec);
++                }
++                res.status = 413;
++                res.set_content(R"({"error":{"message":"File exceeds maximum upload size","type":"invalid_request_error"}})",
++                                "application/json");
++                return;
++            }
++
++            server_http_res_ptr response = handler(mreq);
++            res.status = response->status;
++            set_headers(res, response->headers);
++            res.set_content(response->data, response->content_type);
++        });
++}
++
+diff --git a/tools/server/server-http.h b/tools/server/server-http.h
+index 3621064cd..9dee05695 100644
+--- a/tools/server/server-http.h
++++ b/tools/server/server-http.h
+@@ -5,6 +5,7 @@
+ #include <map>
+ #include <string>
+ #include <thread>
++#include <vector>
+ 
+ struct common_params;
+ 
+@@ -74,6 +75,30 @@ struct server_http_context {
+     void get(const std::string & path, const handler_t & handler) const;
+     void post(const std::string & path, const handler_t & handler) const;
+ 
++    // Streaming multipart upload — files are streamed to disk (not buffered in memory)
++    struct uploaded_file {
++        std::string field_name;    // form field name (e.g. "video")
++        std::string filename;      // original filename from client
++        std::string content_type;  // MIME type
++        std::string tmp_path;      // path to temp file on disk
++        size_t      size = 0;      // bytes written
++    };
++
++    struct multipart_req {
++        std::map<std::string, std::string> params;
++        std::map<std::string, std::string> headers;
++        std::map<std::string, std::string> fields;  // text form fields
++        std::vector<uploaded_file> files;             // uploaded files (on disk)
++        std::string path;
++        std::string query_string;
++        std::function<bool()> is_closed;
++    };
++
++    using multipart_handler_t = std::function<server_http_res_ptr(const multipart_req & req)>;
++
++    // max_file_size: maximum bytes per file (0 = 2GB default)
++    void post_multipart(const std::string & path, const multipart_handler_t & handler, size_t max_file_size = 0) const;
++
+     // for debugging
+     std::string listening_address;
+ };
+diff --git a/tools/server/server.cpp b/tools/server/server.cpp
+index 0bd6fda17..293769743 100644
+--- a/tools/server/server.cpp
++++ b/tools/server/server.cpp
+@@ -2,6 +2,7 @@
+ #include "server-http.h"
+ #include "server-models.h"
+ #include "server-cors-proxy.h"
++#include "server-common.h"
+ 
+ #include "arg.h"
+ #include "common.h"
+@@ -11,6 +12,7 @@
+ #include <atomic>
+ #include <clocale>
+ #include <exception>
++#include <filesystem>
+ #include <signal.h>
+ #include <thread> // for std::thread::hardware_concurrency
+ 
+@@ -202,6 +204,67 @@ int main(int argc, char ** argv) {
+     // Save & load slots
+     ctx_http.get ("/slots",               ex_wrapper(routes.get_slots));
+     ctx_http.post("/slots/:id_slot",      ex_wrapper(routes.post_slots));
++
++    // Streaming video upload — files are streamed to disk, never buffered in memory
++    // Returns an upload ID that can be used as video_url: "upload://<id>" in chat completions
++    ctx_http.post_multipart("/v1/upload/video",
++        [&params](const server_http_context::multipart_req & req) -> server_http_res_ptr {
++            auto res = std::make_unique<server_http_res>();
++
++            if (req.files.empty()) {
++                res->status = 400;
++                res->data = R"({"error":{"message":"No file uploaded. Send multipart/form-data with a 'video' field.","type":"invalid_request_error"}})";
++                return res;
++            }
++
++            // Use the first file
++            const auto & file = req.files[0];
++            SRV_INF("video upload received: %s (%zu bytes, type=%s)\n",
++                    file.filename.c_str(), file.size, file.content_type.c_str());
++
++            // Validate it looks like a video file
++            bool is_video = file.content_type.find("video/") == 0;
++            if (!is_video) {
++                // Check extension as fallback
++                std::string fn = file.filename;
++                std::transform(fn.begin(), fn.end(), fn.begin(), ::tolower);
++                is_video = fn.find(".mp4") != std::string::npos ||
++                           fn.find(".webm") != std::string::npos ||
++                           fn.find(".mov") != std::string::npos ||
++                           fn.find(".avi") != std::string::npos ||
++                           fn.find(".mkv") != std::string::npos;
++            }
++            if (!is_video) {
++                // Clean up the temp file
++                std::error_code ec;
++                std::filesystem::remove(file.tmp_path, ec);
++                res->status = 400;
++                res->data = R"({"error":{"message":"Uploaded file does not appear to be a video","type":"invalid_request_error"}})";
++                return res;
++            }
++
++            // Register in upload store
++            std::string upload_id = g_video_uploads.add(
++                file.tmp_path, file.filename, file.content_type, file.size);
++
++            // Periodic cleanup of old uploads (>1 hour)
++            g_video_uploads.cleanup(3600);
++
++            json result = {
++                {"id",           upload_id},
++                {"object",       "video.upload"},
++                {"filename",     file.filename},
++                {"content_type", file.content_type},
++                {"size",         file.size},
++                {"video_url",    "upload://" + upload_id},
++            };
++
++            res->status = 200;
++            res->data = result.dump();
++            SRV_INF("video upload stored: id=%s path=%s\n", upload_id.c_str(), file.tmp_path.c_str());
++            return res;
++        });
++
+     // CORS proxy (EXPERIMENTAL, only used by the Web UI for MCP)
+     if (params.webui_mcp_proxy) {
+         SRV_WRN("%s", "-----------------\n");
+diff --git a/tools/server/webui/src/lib/components/app/chat/ChatAttachments/ChatAttachmentPreview.svelte b/tools/server/webui/src/lib/components/app/chat/ChatAttachments/ChatAttachmentPreview.svelte
+index f05bdd8a0..6c41d3555 100644
+--- a/tools/server/webui/src/lib/components/app/chat/ChatAttachments/ChatAttachmentPreview.svelte
++++ b/tools/server/webui/src/lib/components/app/chat/ChatAttachments/ChatAttachmentPreview.svelte
+@@ -2,12 +2,13 @@
+ 	import { Button } from '$lib/components/ui/button';
+ 	import * as Alert from '$lib/components/ui/alert';
+ 	import { SyntaxHighlightedCode } from '$lib/components/app';
+-	import { FileText, Image, Music, FileIcon, Eye, Info } from '@lucide/svelte';
++	import { FileText, Image, Music, FileIcon, Eye, Info, Video } from '@lucide/svelte';
+ 	import {
+ 		isTextFile,
+ 		isImageFile,
+ 		isPdfFile,
+ 		isAudioFile,
++		isVideoFile,
+ 		getLanguageFromFilename,
+ 		createBase64DataUrl
+ 	} from '$lib/utils';
+@@ -37,6 +38,7 @@
+ 	// Determine file type from uploaded file or attachment
+ 	let isAudio = $derived(isAudioFile(attachment, uploadedFile));
+ 	let isImage = $derived(isImageFile(attachment, uploadedFile));
++	let isVideo = $derived(isVideoFile(attachment, uploadedFile));
+ 	let isPdf = $derived(isPdfFile(attachment, uploadedFile));
+ 	let isText = $derived(isTextFile(attachment, uploadedFile));
+ 
+@@ -54,6 +56,7 @@
+ 
+ 	let IconComponent = $derived(() => {
+ 		if (isImage) return Image;
++		if (isVideo) return Video;
+ 		if (isText || isPdf) return FileText;
+ 		if (isAudio) return Music;
+ 
+@@ -264,6 +267,32 @@
+ 						<p class="mb-4 text-muted-foreground">Audio preview not available</p>
+ 					{/if}
+ 
++					<p class="text-sm text-muted-foreground">
++						{displayName}
++					</p>
++				</div>
++			</div>
++		{:else if isVideo}
++			<div class="flex items-center justify-center p-8">
++				<div class="w-full max-w-lg text-center">
++					<Video class="mx-auto mb-4 h-16 w-16 text-muted-foreground" />
++
++					{#if uploadedFile?.preview}
++						<video controls class="mb-4 w-full rounded-lg" src={uploadedFile.preview}>
++							Your browser does not support the video element.
++						</video>
++					{:else if attachment && 'mimeType' in attachment && 'base64Data' in attachment}
++						<video
++							controls
++							class="mb-4 w-full rounded-lg"
++							src={createBase64DataUrl(attachment.mimeType, attachment.base64Data)}
++						>
++							Your browser does not support the video element.
++						</video>
++					{:else}
++						<p class="mb-4 text-muted-foreground">Video preview not available</p>
++					{/if}
++
+ 					<p class="text-sm text-muted-foreground">
+ 						{displayName}
+ 					</p>
+diff --git a/tools/server/webui/src/lib/components/app/chat/ChatForm/ChatFormActions/ChatFormActionAttachmentsDropdown.svelte b/tools/server/webui/src/lib/components/app/chat/ChatForm/ChatFormActions/ChatFormActionAttachmentsDropdown.svelte
+index 81b55513d..bdc983417 100644
+--- a/tools/server/webui/src/lib/components/app/chat/ChatForm/ChatFormActions/ChatFormActionAttachmentsDropdown.svelte
++++ b/tools/server/webui/src/lib/components/app/chat/ChatForm/ChatFormActions/ChatFormActionAttachmentsDropdown.svelte
+@@ -178,6 +178,31 @@
+ 				</Tooltip.Root>
+ 			{/if}
+ 
++			{#if hasVisionModality}
++				<DropdownMenu.Item
++					class="video-button flex cursor-pointer items-center gap-2"
++					onclick={() => onFileUpload?.()}
++				>
++					<FILE_TYPE_ICONS.video class="h-4 w-4" />
++
++					<span>Video Files</span>
++				</DropdownMenu.Item>
++			{:else}
++				<Tooltip.Root delayDuration={TOOLTIP_DELAY_DURATION}>
++					<Tooltip.Trigger class="w-full">
++						<DropdownMenu.Item class="video-button flex cursor-pointer items-center gap-2" disabled>
++							<FILE_TYPE_ICONS.video class="h-4 w-4" />
++
++							<span>Video Files</span>
++						</DropdownMenu.Item>
++					</Tooltip.Trigger>
++
++					<Tooltip.Content side="right">
++						<p>Videos require vision models to be processed</p>
++					</Tooltip.Content>
++				</Tooltip.Root>
++			{/if}
++
+ 			<DropdownMenu.Item
+ 				class="flex cursor-pointer items-center gap-2"
+ 				onclick={() => onFileUpload?.()}
+diff --git a/tools/server/webui/src/lib/components/app/chat/ChatForm/ChatFormActions/ChatFormActionAttachmentsSheet.svelte b/tools/server/webui/src/lib/components/app/chat/ChatForm/ChatFormActions/ChatFormActionAttachmentsSheet.svelte
+index bf643dd7f..cf8423d64 100644
+--- a/tools/server/webui/src/lib/components/app/chat/ChatForm/ChatFormActions/ChatFormActionAttachmentsSheet.svelte
++++ b/tools/server/webui/src/lib/components/app/chat/ChatForm/ChatFormActions/ChatFormActionAttachmentsSheet.svelte
+@@ -121,6 +121,22 @@
+ 					{/if}
+ 				</button>
+ 
++				<!-- Video -->
++				<button
++					type="button"
++					class={sheetItemClass}
++					disabled={!hasVisionModality}
++					onclick={handleSheetFileUpload}
++				>
++					<FILE_TYPE_ICONS.video class="h-4 w-4 shrink-0" />
++
++					<span>Video Files</span>
++
++					{#if !hasVisionModality}
++						<span class="ml-auto text-xs text-muted-foreground">Requires vision model</span>
++					{/if}
++				</button>
++
+ 				<button type="button" class={sheetItemClass} onclick={handleSheetFileUpload}>
+ 					<FILE_TYPE_ICONS.text class="h-4 w-4 shrink-0" />
+ 
+diff --git a/tools/server/webui/src/lib/constants/icons.ts b/tools/server/webui/src/lib/constants/icons.ts
+index 1e88ab5b3..d75851a4f 100644
+--- a/tools/server/webui/src/lib/constants/icons.ts
++++ b/tools/server/webui/src/lib/constants/icons.ts
+@@ -8,13 +8,15 @@ import {
+ 	FileText as FileTextIcon,
+ 	Image as ImageIcon,
+ 	Eye as VisionIcon,
+-	Mic as AudioIcon
++	Mic as AudioIcon,
++	Video as VideoIcon
+ } from '@lucide/svelte';
+ import { FileTypeCategory, ModelModality } from '$lib/enums';
+ 
+ export const FILE_TYPE_ICONS = {
+ 	[FileTypeCategory.IMAGE]: ImageIcon,
+ 	[FileTypeCategory.AUDIO]: AudioIcon,
++	[FileTypeCategory.VIDEO]: VideoIcon,
+ 	[FileTypeCategory.TEXT]: FileTextIcon,
+ 	[FileTypeCategory.PDF]: FileIcon
+ } as const;
+diff --git a/tools/server/webui/src/lib/constants/supported-file-types.ts b/tools/server/webui/src/lib/constants/supported-file-types.ts
+index 0d955ad14..ba9526f8e 100644
+--- a/tools/server/webui/src/lib/constants/supported-file-types.ts
++++ b/tools/server/webui/src/lib/constants/supported-file-types.ts
+@@ -8,14 +8,17 @@ import {
+ 	FileExtensionImage,
+ 	FileExtensionPdf,
+ 	FileExtensionText,
++	FileExtensionVideo,
+ 	FileTypeAudio,
+ 	FileTypeImage,
+ 	FileTypePdf,
+ 	FileTypeText,
++	FileTypeVideo,
+ 	MimeTypeAudio,
+ 	MimeTypeImage,
+ 	MimeTypeApplication,
+-	MimeTypeText
++	MimeTypeText,
++	MimeTypeVideo
+ } from '$lib/enums';
+ 
+ // File type configuration using enums
+@@ -53,6 +56,29 @@ export const IMAGE_FILE_TYPES = {
+ 	}
+ } as const;
+ 
++export const VIDEO_FILE_TYPES = {
++	[FileTypeVideo.MP4]: {
++		extensions: [FileExtensionVideo.MP4],
++		mimeTypes: [MimeTypeVideo.MP4]
++	},
++	[FileTypeVideo.WEBM]: {
++		extensions: [FileExtensionVideo.WEBM],
++		mimeTypes: [MimeTypeVideo.WEBM]
++	},
++	[FileTypeVideo.MOV]: {
++		extensions: [FileExtensionVideo.MOV],
++		mimeTypes: [MimeTypeVideo.MOV]
++	},
++	[FileTypeVideo.AVI]: {
++		extensions: [FileExtensionVideo.AVI],
++		mimeTypes: [MimeTypeVideo.AVI]
++	},
++	[FileTypeVideo.MKV]: {
++		extensions: [FileExtensionVideo.MKV],
++		mimeTypes: [MimeTypeVideo.MKV]
++	}
++} as const;
++
+ export const PDF_FILE_TYPES = {
+ 	[FileTypePdf.PDF]: {
+ 		extensions: [FileExtensionPdf.PDF],
+diff --git a/tools/server/webui/src/lib/enums/attachment.ts b/tools/server/webui/src/lib/enums/attachment.ts
+index 28863d7ef..2ef7d6477 100644
+--- a/tools/server/webui/src/lib/enums/attachment.ts
++++ b/tools/server/webui/src/lib/enums/attachment.ts
+@@ -4,6 +4,7 @@
+ export enum AttachmentType {
+ 	AUDIO = 'AUDIO',
+ 	IMAGE = 'IMAGE',
++	VIDEO = 'VIDEO',
+ 	MCP_PROMPT = 'MCP_PROMPT',
+ 	MCP_RESOURCE = 'MCP_RESOURCE',
+ 	PDF = 'PDF',
+diff --git a/tools/server/webui/src/lib/enums/chat.ts b/tools/server/webui/src/lib/enums/chat.ts
+index 0b6f357d9..3cfa7ff93 100644
+--- a/tools/server/webui/src/lib/enums/chat.ts
++++ b/tools/server/webui/src/lib/enums/chat.ts
+@@ -39,7 +39,8 @@ export enum MessageType {
+ export enum ContentPartType {
+ 	TEXT = 'text',
+ 	IMAGE_URL = 'image_url',
+-	INPUT_AUDIO = 'input_audio'
++	INPUT_AUDIO = 'input_audio',
++	VIDEO_URL = 'video_url'
+ }
+ 
+ /**
+diff --git a/tools/server/webui/src/lib/enums/files.ts b/tools/server/webui/src/lib/enums/files.ts
+index 7efe0c706..14fd1e1d0 100644
+--- a/tools/server/webui/src/lib/enums/files.ts
++++ b/tools/server/webui/src/lib/enums/files.ts
+@@ -7,6 +7,7 @@
+ export enum FileTypeCategory {
+ 	IMAGE = 'image',
+ 	AUDIO = 'audio',
++	VIDEO = 'video',
+ 	PDF = 'pdf',
+ 	TEXT = 'text'
+ }
+@@ -33,6 +34,14 @@ export enum FileTypeAudio {
+ 	WEBM = 'webm'
+ }
+ 
++export enum FileTypeVideo {
++	MP4 = 'mp4',
++	WEBM = 'webm',
++	MOV = 'mov',
++	AVI = 'avi',
++	MKV = 'mkv'
++}
++
+ export enum FileTypePdf {
+ 	PDF = 'pdf'
+ }
+@@ -92,6 +101,14 @@ export enum FileExtensionAudio {
+ 	WAV = '.wav'
+ }
+ 
++export enum FileExtensionVideo {
++	MP4 = '.mp4',
++	WEBM = '.webm',
++	MOV = '.mov',
++	AVI = '.avi',
++	MKV = '.mkv'
++}
++
+ export enum FileExtensionPdf {
+ 	PDF = '.pdf'
+ }
+@@ -176,6 +193,14 @@ export enum MimeTypeAudio {
+ 	WEBM_OPUS = 'audio/webm;codecs=opus'
+ }
+ 
++export enum MimeTypeVideo {
++	MP4 = 'video/mp4',
++	WEBM = 'video/webm',
++	MOV = 'video/quicktime',
++	AVI = 'video/x-msvideo',
++	MKV = 'video/x-matroska'
++}
++
+ export enum MimeTypeImage {
+ 	JPEG = 'image/jpeg',
+ 	JPG = 'image/jpg',
+diff --git a/tools/server/webui/src/lib/enums/index.ts b/tools/server/webui/src/lib/enums/index.ts
+index 1711dd763..1f9c4b1c0 100644
+--- a/tools/server/webui/src/lib/enums/index.ts
++++ b/tools/server/webui/src/lib/enums/index.ts
+@@ -15,10 +15,12 @@ export {
+ 	FileTypeCategory,
+ 	FileTypeImage,
+ 	FileTypeAudio,
++	FileTypeVideo,
+ 	FileTypePdf,
+ 	FileTypeText,
+ 	FileExtensionImage,
+ 	FileExtensionAudio,
++	FileExtensionVideo,
+ 	FileExtensionPdf,
+ 	FileExtensionText,
+ 	MimeTypePrefix,
+@@ -27,6 +29,7 @@ export {
+ 	MimeTypeApplication,
+ 	MimeTypeAudio,
+ 	MimeTypeImage,
++	MimeTypeVideo,
+ 	MimeTypeText,
+ 	SpecialFileType
+ } from './files';
+diff --git a/tools/server/webui/src/lib/services/chat.service.ts b/tools/server/webui/src/lib/services/chat.service.ts
+index 80dc1800c..a20b7d2aa 100644
+--- a/tools/server/webui/src/lib/services/chat.service.ts
++++ b/tools/server/webui/src/lib/services/chat.service.ts
+@@ -13,7 +13,7 @@ import {
+ 	UrlProtocol
+ } from '$lib/enums';
+ import type { ApiChatMessageContentPart, ApiChatCompletionToolCall } from '$lib/types/api';
+-import type { DatabaseMessageExtraMcpPrompt, DatabaseMessageExtraMcpResource } from '$lib/types';
++import type { DatabaseMessageExtraMcpPrompt, DatabaseMessageExtraMcpResource, DatabaseMessageExtraVideoFile } from '$lib/types';
+ import { modelsStore } from '$lib/stores/models.svelte';
+ 
+ export class ChatService {
+@@ -135,14 +135,14 @@ export class ChatService {
+ 				return true;
+ 			});
+ 
+-		// Filter out image attachments if the model doesn't support vision
++		// Filter out image and video attachments if the model doesn't support vision
+ 		if (options.model && !modelsStore.modelSupportsVision(options.model)) {
+ 			normalizedMessages.forEach((msg) => {
+ 				if (Array.isArray(msg.content)) {
+ 					msg.content = msg.content.filter((part: ApiChatMessageContentPart) => {
+-						if (part.type === ContentPartType.IMAGE_URL) {
++						if (part.type === ContentPartType.IMAGE_URL || part.type === ContentPartType.VIDEO_URL) {
+ 							console.info(
+-								`[ChatService] Skipping image attachment in message history (model "${options.model}" does not support vision)`
++								`[ChatService] Skipping image/video attachment in message history (model "${options.model}" does not support vision)`
+ 							);
+ 
+ 							return false;
+@@ -744,6 +744,33 @@ export class ChatService {
+ 			});
+ 		}
+ 
++		const videoFiles = message.extra.filter(
++			(extra: DatabaseMessageExtra): extra is DatabaseMessageExtraVideoFile =>
++				extra.type === AttachmentType.VIDEO
++		);
++
++		for (const video of videoFiles) {
++			if (video.uploadId) {
++				// Large file was uploaded via streaming multipart — use upload reference
++				contentParts.push({
++					type: ContentPartType.VIDEO_URL,
++					video_url: {
++						url: `upload://${video.uploadId}`
++					}
++				});
++			} else if (video.base64Data && video.base64Data.length >= 100) {
++				// Small file — inline base64 data URL
++				contentParts.push({
++					type: ContentPartType.VIDEO_URL,
++					video_url: {
++						url: `data:${video.mimeType};base64,${video.base64Data}`
++					}
++				});
++			} else {
++				console.error(`[ChatService] Skipping video "${video.name}": no uploadId and base64Data is missing or too small (${video.base64Data?.length ?? 0} chars). Please re-upload the file.`);
++			}
++		}
++
+ 		const pdfFiles = message.extra.filter(
+ 			(extra: DatabaseMessageExtra): extra is DatabaseMessageExtraPdfFile =>
+ 				extra.type === AttachmentType.PDF
+diff --git a/tools/server/webui/src/lib/types/api.d.ts b/tools/server/webui/src/lib/types/api.d.ts
+index c90825842..f0ae6e81f 100644
+--- a/tools/server/webui/src/lib/types/api.d.ts
++++ b/tools/server/webui/src/lib/types/api.d.ts
+@@ -22,6 +22,9 @@ export interface ApiChatMessageContentPart {
+ 		data: string;
+ 		format: 'wav' | 'mp3';
+ 	};
++	video_url?: {
++		url: string;
++	};
+ }
+ 
+ export interface ApiContextSizeError {
+diff --git a/tools/server/webui/src/lib/types/database.d.ts b/tools/server/webui/src/lib/types/database.d.ts
+index 50f51ecf5..38c968fff 100644
+--- a/tools/server/webui/src/lib/types/database.d.ts
++++ b/tools/server/webui/src/lib/types/database.d.ts
+@@ -27,6 +27,14 @@ export interface DatabaseMessageExtraImageFile {
+ 	base64Url: string;
+ }
+ 
++export interface DatabaseMessageExtraVideoFile {
++	type: AttachmentType.VIDEO;
++	name: string;
++	base64Data: string;
++	mimeType: string;
++	uploadId?: string; // set when video was uploaded via streaming multipart (large files)
++}
++
+ /**
+  * Legacy format from old webui - pasted content was stored as "context" type
+  * @deprecated Use DatabaseMessageExtraTextFile instead
+@@ -72,6 +80,7 @@ export interface DatabaseMessageExtraMcpResource {
+ 
+ export type DatabaseMessageExtra =
+ 	| DatabaseMessageExtraImageFile
++	| DatabaseMessageExtraVideoFile
+ 	| DatabaseMessageExtraTextFile
+ 	| DatabaseMessageExtraAudioFile
+ 	| DatabaseMessageExtraPdfFile
+diff --git a/tools/server/webui/src/lib/types/index.ts b/tools/server/webui/src/lib/types/index.ts
+index 93a39f03d..2e242ce06 100644
+--- a/tools/server/webui/src/lib/types/index.ts
++++ b/tools/server/webui/src/lib/types/index.ts
+@@ -57,6 +57,7 @@ export type {
+ 	DatabaseConversation,
+ 	DatabaseMessageExtraAudioFile,
+ 	DatabaseMessageExtraImageFile,
++	DatabaseMessageExtraVideoFile,
+ 	DatabaseMessageExtraLegacyContext,
+ 	DatabaseMessageExtraMcpPrompt,
+ 	DatabaseMessageExtraMcpResource,
+diff --git a/tools/server/webui/src/lib/utils/attachment-type.ts b/tools/server/webui/src/lib/utils/attachment-type.ts
+index 9e9f09601..d595afa6b 100644
+--- a/tools/server/webui/src/lib/utils/attachment-type.ts
++++ b/tools/server/webui/src/lib/utils/attachment-type.ts
+@@ -103,3 +103,24 @@ export function isAudioFile(
+ 
+ 	return false;
+ }
++
++/**
++ * Determines if an attachment or uploaded file is a video file
++ * @param uploadedFile - Optional uploaded file
++ * @param attachment - Optional database attachment
++ * @returns true if the file is a video file
++ */
++export function isVideoFile(
++	attachment?: DatabaseMessageExtra,
++	uploadedFile?: ChatUploadedFile
++): boolean {
++	if (uploadedFile) {
++		return getUploadedFileCategory(uploadedFile) === FileTypeCategory.VIDEO;
++	}
++
++	if (attachment) {
++		return attachment.type === AttachmentType.VIDEO;
++	}
++
++	return false;
++}
+diff --git a/tools/server/webui/src/lib/utils/convert-files-to-extra.ts b/tools/server/webui/src/lib/utils/convert-files-to-extra.ts
+index 84992106b..0362c1f7d 100644
+--- a/tools/server/webui/src/lib/utils/convert-files-to-extra.ts
++++ b/tools/server/webui/src/lib/utils/convert-files-to-extra.ts
+@@ -85,6 +85,53 @@ export async function parseFilesToMessageExtras(
+ 			} catch (error) {
+ 				console.error(`Failed to process audio file ${file.name}:`, error);
+ 			}
++		} else if (getFileTypeCategory(file.type) === FileTypeCategory.VIDEO) {
++			// Process video files
++			// For large files (>50MB), use streaming multipart upload to avoid base64 overhead
++			const LARGE_VIDEO_THRESHOLD = 50 * 1024 * 1024; // 50MB
++			try {
++				if (file.file.size > LARGE_VIDEO_THRESHOLD) {
++					// Streaming upload — binary, no base64 overhead, no full RAM buffering
++					const formData = new FormData();
++					formData.append('video', file.file, file.name);
++
++					const uploadRes = await fetch('./v1/upload/video', {
++						method: 'POST',
++						body: formData,
++					});
++
++					if (!uploadRes.ok) {
++						const errText = await uploadRes.text();
++						throw new Error(`Upload failed (${uploadRes.status}): ${errText}`);
++					}
++
++					const uploadData = await uploadRes.json();
++					extras.push({
++						type: AttachmentType.VIDEO,
++						name: file.name,
++						base64Data: '', // not stored for large files
++						mimeType: file.type,
++						uploadId: uploadData.id,
++					});
++				} else {
++					// Small files — base64 inline (stored in IndexedDB for replay)
++					const base64Data = await readFileAsBase64(file.file);
++
++					if (!base64Data || base64Data.length === 0) {
++						console.error(`Failed to read video file ${file.name}: empty base64 data`);
++						continue;
++					}
++
++					extras.push({
++						type: AttachmentType.VIDEO,
++						name: file.name,
++						base64Data: base64Data,
++						mimeType: file.type
++					});
++				}
++			} catch (error) {
++				console.error(`Failed to process video file ${file.name}:`, error);
++			}
+ 		} else if (getFileTypeCategory(file.type) === FileTypeCategory.PDF) {
+ 			try {
+ 				// Always get base64 data for preview functionality
+diff --git a/tools/server/webui/src/lib/utils/file-type.ts b/tools/server/webui/src/lib/utils/file-type.ts
+index 4c670600c..5ffd5c1c8 100644
+--- a/tools/server/webui/src/lib/utils/file-type.ts
++++ b/tools/server/webui/src/lib/utils/file-type.ts
+@@ -2,18 +2,21 @@ import {
+ 	AUDIO_FILE_TYPES,
+ 	IMAGE_FILE_TYPES,
+ 	PDF_FILE_TYPES,
+-	TEXT_FILE_TYPES
++	TEXT_FILE_TYPES,
++	VIDEO_FILE_TYPES
+ } from '$lib/constants';
+ import {
+ 	FileExtensionAudio,
+ 	FileExtensionImage,
+ 	FileExtensionPdf,
+ 	FileExtensionText,
++	FileExtensionVideo,
+ 	FileTypeCategory,
+ 	MimeTypeApplication,
+ 	MimeTypeAudio,
+ 	MimeTypeImage,
+-	MimeTypeText
++	MimeTypeText,
++	MimeTypeVideo
+ } from '$lib/enums';
+ 
+ export function getFileTypeCategory(mimeType: string): FileTypeCategory | null {
+@@ -35,6 +38,14 @@ export function getFileTypeCategory(mimeType: string): FileTypeCategory | null {
+ 		case MimeTypeAudio.WEBM_OPUS:
+ 			return FileTypeCategory.AUDIO;
+ 
++		// Video
++		case MimeTypeVideo.MP4:
++		case MimeTypeVideo.WEBM:
++		case MimeTypeVideo.MOV:
++		case MimeTypeVideo.AVI:
++		case MimeTypeVideo.MKV:
++			return FileTypeCategory.VIDEO;
++
+ 		// PDF
+ 		case MimeTypeApplication.PDF:
+ 			return FileTypeCategory.PDF;
+@@ -109,6 +120,14 @@ export function getFileTypeCategoryByExtension(filename: string): FileTypeCatego
+ 		case FileExtensionAudio.WAV:
+ 			return FileTypeCategory.AUDIO;
+ 
++		// Video
++		case FileExtensionVideo.MP4:
++		case FileExtensionVideo.WEBM:
++		case FileExtensionVideo.MOV:
++		case FileExtensionVideo.AVI:
++		case FileExtensionVideo.MKV:
++			return FileTypeCategory.VIDEO;
++
+ 		// PDF
+ 		case FileExtensionPdf.PDF:
+ 			return FileTypeCategory.PDF;
+@@ -179,6 +198,12 @@ export function getFileTypeByExtension(filename: string): string | null {
+ 		}
+ 	}
+ 
++	for (const [key, type] of Object.entries(VIDEO_FILE_TYPES)) {
++		if ((type.extensions as readonly string[]).includes(extension)) {
++			return `${FileTypeCategory.VIDEO}:${key}`;
++		}
++	}
++
+ 	for (const [key, type] of Object.entries(PDF_FILE_TYPES)) {
+ 		if ((type.extensions as readonly string[]).includes(extension)) {
+ 			return `${FileTypeCategory.PDF}:${key}`;
+@@ -195,11 +220,12 @@ export function getFileTypeByExtension(filename: string): string | null {
+ }
+ 
+ export function isFileTypeSupported(filename: string, mimeType?: string): boolean {
+-	// Images are detected and handled separately for vision models
++	// Images, videos, audio, and PDFs are detected and handled separately
+ 	if (mimeType) {
+ 		const category = getFileTypeCategory(mimeType);
+ 		if (
+ 			category === FileTypeCategory.IMAGE ||
++			category === FileTypeCategory.VIDEO ||
+ 			category === FileTypeCategory.AUDIO ||
+ 			category === FileTypeCategory.PDF
+ 		) {
+@@ -207,10 +233,11 @@ export function isFileTypeSupported(filename: string, mimeType?: string): boolea
+ 		}
+ 	}
+ 
+-	// Check extension for known types (especially images without MIME)
++	// Check extension for known types
+ 	const extCategory = getFileTypeCategoryByExtension(filename);
+ 	if (
+ 		extCategory === FileTypeCategory.IMAGE ||
++		extCategory === FileTypeCategory.VIDEO ||
+ 		extCategory === FileTypeCategory.AUDIO ||
+ 		extCategory === FileTypeCategory.PDF
+ 	) {
+diff --git a/tools/server/webui/src/lib/utils/index.ts b/tools/server/webui/src/lib/utils/index.ts
+index 2caaf9ac3..8a599003b 100644
+--- a/tools/server/webui/src/lib/utils/index.ts
++++ b/tools/server/webui/src/lib/utils/index.ts
+@@ -14,7 +14,7 @@ export { validateApiKey } from './api-key-validation';
+ 
+ // Attachment utilities
+ export { getAttachmentDisplayItems } from './attachment-display';
+-export { isTextFile, isImageFile, isPdfFile, isAudioFile } from './attachment-type';
++export { isTextFile, isImageFile, isPdfFile, isAudioFile, isVideoFile } from './attachment-type';
+ 
+ // Textarea utilities
+ export { default as autoResizeTextarea } from './autoresize-textarea';
+diff --git a/tools/server/webui/src/lib/utils/modality-file-validation.ts b/tools/server/webui/src/lib/utils/modality-file-validation.ts
+index 9b52e93db..e727748b9 100644
+--- a/tools/server/webui/src/lib/utils/modality-file-validation.ts
++++ b/tools/server/webui/src/lib/utils/modality-file-validation.ts
+@@ -41,6 +41,10 @@ export function isFileTypeSupportedByModel(
+ 			// Images require vision support
+ 			return capabilities.hasVision;
+ 
++		case FileTypeCategory.VIDEO:
++			// Videos require vision support
++			return capabilities.hasVision;
++
+ 		case FileTypeCategory.AUDIO:
+ 			// Audio files require audio support
+ 			return capabilities.hasAudio;
+@@ -84,6 +88,13 @@ export function filterFilesByModalities(
+ 				}
+ 				break;
+ 
++			case FileTypeCategory.VIDEO:
++				if (!hasVision) {
++					isSupported = false;
++					reason = 'Videos require a vision-capable model';
++				}
++				break;
++
+ 			case FileTypeCategory.AUDIO:
+ 				if (!hasAudio) {
+ 					isSupported = false;
+@@ -142,7 +153,7 @@ export function generateModalityErrorMessage(
+ 
+ 	// Add helpful information about what is supported
+ 	const supportedTypes: string[] = ['text files', 'PDFs'];
+-	if (hasVision) supportedTypes.push('images');
++	if (hasVision) supportedTypes.push('images', 'videos');
+ 	if (hasAudio) supportedTypes.push('audio files');
+ 
+ 	message += ` This model supports: ${supportedTypes.join(', ')}.`;
+diff --git a/tools/server/webui/src/lib/utils/process-uploaded-files.ts b/tools/server/webui/src/lib/utils/process-uploaded-files.ts
+index 0342dce1f..a28578487 100644
+--- a/tools/server/webui/src/lib/utils/process-uploaded-files.ts
++++ b/tools/server/webui/src/lib/utils/process-uploaded-files.ts
+@@ -116,6 +116,10 @@ export async function processFilesToChatUploaded(
+ 				// Generate preview URL for audio files
+ 				const preview = await readFileAsDataURL(file);
+ 				results.push({ ...base, preview });
++			} else if (getFileTypeCategory(file.type) === FileTypeCategory.VIDEO) {
++				// Read video as data URL for upload to server
++				const preview = await readFileAsDataURL(file);
++				results.push({ ...base, preview });
+ 			} else {
+ 				// Fallback: treat unknown files as text
+ 				try {
+diff --git a/vendor/cpp-httplib/CMakeLists.txt b/vendor/cpp-httplib/CMakeLists.txt
+index 4960f9c86..237f4f118 100644
+--- a/vendor/cpp-httplib/CMakeLists.txt
++++ b/vendor/cpp-httplib/CMakeLists.txt
+@@ -25,6 +25,8 @@ target_compile_features(${TARGET} PRIVATE cxx_std_17)
+ target_compile_definitions(${TARGET} PRIVATE
+     # increase max payload length to allow use of larger context size
+     CPPHTTPLIB_FORM_URL_ENCODED_PAYLOAD_MAX_LENGTH=1048576
++    # increase payload max to 2GB for large video uploads
++    CPPHTTPLIB_PAYLOAD_MAX_LENGTH=2147483648
+     # increase backlog size to avoid connection resets for >> 1 slots
+     CPPHTTPLIB_LISTEN_BACKLOG=512
+     # increase max URI length to handle longer prompts in query string

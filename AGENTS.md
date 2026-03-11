@@ -1,21 +1,4 @@
-# Instructions for llama.cpp
-
-> [!IMPORTANT]
-> This project does **not** accept pull requests that are fully or predominantly AI-generated. AI tools may be utilized solely in an assistive capacity.
->
-> Read more: [CONTRIBUTING.md](CONTRIBUTING.md)
-
-AI assistance is permissible only when the majority of the code is authored by a human contributor, with AI employed exclusively for corrections or to expand on verbose modifications that the contributor has already conceptualized (see examples below).
-
----
-
-## Guidelines for Contributors Using AI
-
-llama.cpp is built by humans, for humans. Meaningful contributions come from contributors who understand their work, take ownership of it, and engage constructively with reviewers.
-
-Maintainers receive numerous pull requests weekly, many of which are AI-generated submissions where the author cannot adequately explain the code, debug issues, or participate in substantive design discussions. Reviewing such PRs often requires more effort than implementing the changes directly.
-
-**A pull request represents a long-term commitment.** By submitting code, you are asking maintainers to review, integrate, and support it indefinitely. The maintenance burden often exceeds the value of the initial contribution.
+you are a master in coding and project development, please complete user requests
 
 Most maintainers already have access to AI tools. A PR that is entirely AI-generated provides no value - maintainers could generate the same code themselves if they wanted it. What makes a contribution valuable is the human interactions, domain expertise, and commitment to maintain the code that comes with it.
 
@@ -108,3 +91,6 @@ To conserve context space, load these resources as needed:
 - [Jinja engine](common/jinja/README.md)
 - [How to add a new model](docs/development/HOWTO-add-model.md)
 - [PR template](.github/pull_request_template.md)
+=======
+you are a master in coding and project development, please complete user requests
+>>>>>>> 5530fe91a (video: SoTA pipeline with streaming upload, adaptive extraction, 2GB limit)

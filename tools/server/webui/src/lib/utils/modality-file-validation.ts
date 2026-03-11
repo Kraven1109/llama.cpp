@@ -41,6 +41,10 @@ export function isFileTypeSupportedByModel(
 			// Images require vision support
 			return capabilities.hasVision;
 
+		case FileTypeCategory.VIDEO:
+			// Videos require vision support
+			return capabilities.hasVision;
+
 		case FileTypeCategory.AUDIO:
 			// Audio files require audio support
 			return capabilities.hasAudio;
@@ -81,6 +85,13 @@ export function filterFilesByModalities(
 				if (!hasVision) {
 					isSupported = false;
 					reason = 'Images require a vision-capable model';
+				}
+				break;
+
+			case FileTypeCategory.VIDEO:
+				if (!hasVision) {
+					isSupported = false;
+					reason = 'Videos require a vision-capable model';
 				}
 				break;
 
@@ -142,7 +153,7 @@ export function generateModalityErrorMessage(
 
 	// Add helpful information about what is supported
 	const supportedTypes: string[] = ['text files', 'PDFs'];
-	if (hasVision) supportedTypes.push('images');
+	if (hasVision) supportedTypes.push('images', 'videos');
 	if (hasAudio) supportedTypes.push('audio files');
 
 	message += ` This model supports: ${supportedTypes.join(', ')}.`;

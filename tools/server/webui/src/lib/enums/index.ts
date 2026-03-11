@@ -15,10 +15,12 @@ export {
 	FileTypeCategory,
 	FileTypeImage,
 	FileTypeAudio,
+	FileTypeVideo,
 	FileTypePdf,
 	FileTypeText,
 	FileExtensionImage,
 	FileExtensionAudio,
+	FileExtensionVideo,
 	FileExtensionPdf,
 	FileExtensionText,
 	MimeTypePrefix,
@@ -27,6 +29,7 @@ export {
 	MimeTypeApplication,
 	MimeTypeAudio,
 	MimeTypeImage,
+	MimeTypeVideo,
 	MimeTypeText,
 	SpecialFileType
 } from './files';

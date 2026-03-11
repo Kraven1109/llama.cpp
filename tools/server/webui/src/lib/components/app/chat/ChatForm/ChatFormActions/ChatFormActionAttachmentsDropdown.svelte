@@ -178,6 +178,31 @@
 				</Tooltip.Root>
 			{/if}
 
+			{#if hasVisionModality}
+				<DropdownMenu.Item
+					class="video-button flex cursor-pointer items-center gap-2"
+					onclick={() => onFileUpload?.()}
+				>
+					<FILE_TYPE_ICONS.video class="h-4 w-4" />
+
+					<span>Video Files</span>
+				</DropdownMenu.Item>
+			{:else}
+				<Tooltip.Root delayDuration={TOOLTIP_DELAY_DURATION}>
+					<Tooltip.Trigger class="w-full">
+						<DropdownMenu.Item class="video-button flex cursor-pointer items-center gap-2" disabled>
+							<FILE_TYPE_ICONS.video class="h-4 w-4" />
+
+							<span>Video Files</span>
+						</DropdownMenu.Item>
+					</Tooltip.Trigger>
+
+					<Tooltip.Content side="right">
+						<p>Videos require vision models to be processed</p>
+					</Tooltip.Content>
+				</Tooltip.Root>
+			{/if}
+
 			<DropdownMenu.Item
 				class="flex cursor-pointer items-center gap-2"
 				onclick={() => onFileUpload?.()}

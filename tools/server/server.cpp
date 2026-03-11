@@ -3,6 +3,7 @@
 #include "server-models.h"
 #include "server-cors-proxy.h"
 #include "server-tools.h"
+#include "server-common.h"
 
 #include "arg.h"
 #include "common.h"
@@ -12,6 +13,7 @@
 #include <atomic>
 #include <clocale>
 #include <exception>
+#include <filesystem>
 #include <signal.h>
 #include <thread> // for std::thread::hardware_concurrency
 
@@ -204,6 +206,67 @@ int main(int argc, char ** argv) {
     // Save & load slots
     ctx_http.get ("/slots",               ex_wrapper(routes.get_slots));
     ctx_http.post("/slots/:id_slot",      ex_wrapper(routes.post_slots));
+
+    // Streaming video upload — files are streamed to disk, never buffered in memory
+    // Returns an upload ID that can be used as video_url: "upload://<id>" in chat completions
+    ctx_http.post_multipart("/v1/upload/video",
+        [&params](const server_http_context::multipart_req & req) -> server_http_res_ptr {
+            auto res = std::make_unique<server_http_res>();
+
+            if (req.files.empty()) {
+                res->status = 400;
+                res->data = R"({"error":{"message":"No file uploaded. Send multipart/form-data with a 'video' field.","type":"invalid_request_error"}})";
+                return res;
+            }
+
+            // Use the first file
+            const auto & file = req.files[0];
+            SRV_INF("video upload received: %s (%zu bytes, type=%s)\n",
+                    file.filename.c_str(), file.size, file.content_type.c_str());
+
+            // Validate it looks like a video file
+            bool is_video = file.content_type.find("video/") == 0;
+            if (!is_video) {
+                // Check extension as fallback
+                std::string fn = file.filename;
+                std::transform(fn.begin(), fn.end(), fn.begin(), ::tolower);
+                is_video = fn.find(".mp4") != std::string::npos ||
+                           fn.find(".webm") != std::string::npos ||
+                           fn.find(".mov") != std::string::npos ||
+                           fn.find(".avi") != std::string::npos ||
+                           fn.find(".mkv") != std::string::npos;
+            }
+            if (!is_video) {
+                // Clean up the temp file
+                std::error_code ec;
+                std::filesystem::remove(file.tmp_path, ec);
+                res->status = 400;
+                res->data = R"({"error":{"message":"Uploaded file does not appear to be a video","type":"invalid_request_error"}})";
+                return res;
+            }
+
+            // Register in upload store
+            std::string upload_id = g_video_uploads.add(
+                file.tmp_path, file.filename, file.content_type, file.size);
+
+            // Periodic cleanup of old uploads (>1 hour)
+            g_video_uploads.cleanup(3600);
+
+            json result = {
+                {"id",           upload_id},
+                {"object",       "video.upload"},
+                {"filename",     file.filename},
+                {"content_type", file.content_type},
+                {"size",         file.size},
+                {"video_url",    "upload://" + upload_id},
+            };
+
+            res->status = 200;
+            res->data = result.dump();
+            SRV_INF("video upload stored: id=%s path=%s\n", upload_id.c_str(), file.tmp_path.c_str());
+            return res;
+        });
+
     // CORS proxy (EXPERIMENTAL, only used by the Web UI for MCP)
     if (params.webui_mcp_proxy) {
         SRV_WRN("%s", "-----------------\n");

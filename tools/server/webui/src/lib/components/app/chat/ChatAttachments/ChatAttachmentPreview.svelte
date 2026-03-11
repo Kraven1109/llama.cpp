@@ -2,12 +2,13 @@
 	import { Button } from '$lib/components/ui/button';
 	import * as Alert from '$lib/components/ui/alert';
 	import { SyntaxHighlightedCode } from '$lib/components/app';
-	import { FileText, Image, Music, FileIcon, Eye, Info } from '@lucide/svelte';
+	import { FileText, Image, Music, FileIcon, Eye, Info, Video } from '@lucide/svelte';
 	import {
 		isTextFile,
 		isImageFile,
 		isPdfFile,
 		isAudioFile,
+		isVideoFile,
 		getLanguageFromFilename,
 		createBase64DataUrl
 	} from '$lib/utils';
@@ -37,6 +38,7 @@
 	// Determine file type from uploaded file or attachment
 	let isAudio = $derived(isAudioFile(attachment, uploadedFile));
 	let isImage = $derived(isImageFile(attachment, uploadedFile));
+	let isVideo = $derived(isVideoFile(attachment, uploadedFile));
 	let isPdf = $derived(isPdfFile(attachment, uploadedFile));
 	let isText = $derived(isTextFile(attachment, uploadedFile));
 
@@ -54,6 +56,7 @@
 
 	let IconComponent = $derived(() => {
 		if (isImage) return Image;
+		if (isVideo) return Video;
 		if (isText || isPdf) return FileText;
 		if (isAudio) return Music;
 
@@ -262,6 +265,32 @@
 						</audio>
 					{:else}
 						<p class="mb-4 text-muted-foreground">Audio preview not available</p>
+					{/if}
+
+					<p class="text-sm text-muted-foreground">
+						{displayName}
+					</p>
+				</div>
+			</div>
+		{:else if isVideo}
+			<div class="flex items-center justify-center p-8">
+				<div class="w-full max-w-lg text-center">
+					<Video class="mx-auto mb-4 h-16 w-16 text-muted-foreground" />
+
+					{#if uploadedFile?.preview}
+						<video controls class="mb-4 w-full rounded-lg" src={uploadedFile.preview}>
+							Your browser does not support the video element.
+						</video>
+					{:else if attachment && 'mimeType' in attachment && 'base64Data' in attachment}
+						<video
+							controls
+							class="mb-4 w-full rounded-lg"
+							src={createBase64DataUrl(attachment.mimeType, attachment.base64Data)}
+						>
+							Your browser does not support the video element.
+						</video>
+					{:else}
+						<p class="mb-4 text-muted-foreground">Video preview not available</p>
 					{/if}
 
 					<p class="text-sm text-muted-foreground">

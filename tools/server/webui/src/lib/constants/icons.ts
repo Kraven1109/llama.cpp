@@ -8,13 +8,15 @@ import {
 	FileText as FileTextIcon,
 	Image as ImageIcon,
 	Eye as VisionIcon,
-	Mic as AudioIcon
+	Mic as AudioIcon,
+	Video as VideoIcon
 } from '@lucide/svelte';
 import { FileTypeCategory, ModelModality } from '$lib/enums';
 
 export const FILE_TYPE_ICONS = {
 	[FileTypeCategory.IMAGE]: ImageIcon,
 	[FileTypeCategory.AUDIO]: AudioIcon,
+	[FileTypeCategory.VIDEO]: VideoIcon,
 	[FileTypeCategory.TEXT]: FileTextIcon,
 	[FileTypeCategory.PDF]: FileIcon
 } as const;

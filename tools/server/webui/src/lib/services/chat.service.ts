@@ -14,7 +14,7 @@ import {
 	UrlProtocol
 } from '$lib/enums';
 import type { ApiChatMessageContentPart, ApiChatCompletionToolCall } from '$lib/types/api';
-import type { DatabaseMessageExtraMcpPrompt, DatabaseMessageExtraMcpResource } from '$lib/types';
+import type { DatabaseMessageExtraMcpPrompt, DatabaseMessageExtraMcpResource, DatabaseMessageExtraVideoFile } from '$lib/types';
 import { modelsStore } from '$lib/stores/models.svelte';
 
 export class ChatService {
@@ -105,14 +105,14 @@ export class ChatService {
 				return true;
 			});
 
-		// Filter out image attachments if the model doesn't support vision
+		// Filter out image and video attachments if the model doesn't support vision
 		if (options.model && !modelsStore.modelSupportsVision(options.model)) {
 			normalizedMessages.forEach((msg) => {
 				if (Array.isArray(msg.content)) {
 					msg.content = msg.content.filter((part: ApiChatMessageContentPart) => {
-						if (part.type === ContentPartType.IMAGE_URL) {
+						if (part.type === ContentPartType.IMAGE_URL || part.type === ContentPartType.VIDEO_URL) {
 							console.info(
-								`[ChatService] Skipping image attachment in message history (model "${options.model}" does not support vision)`
+								`[ChatService] Skipping image/video attachment in message history (model "${options.model}" does not support vision)`
 							);
 
 							return false;
@@ -721,6 +721,33 @@ export class ChatService {
 					format: audio.mimeType.includes('wav') ? 'wav' : 'mp3'
 				}
 			});
+		}
+
+		const videoFiles = message.extra.filter(
+			(extra: DatabaseMessageExtra): extra is DatabaseMessageExtraVideoFile =>
+				extra.type === AttachmentType.VIDEO
+		);
+
+		for (const video of videoFiles) {
+			if (video.uploadId) {
+				// Large file was uploaded via streaming multipart — use upload reference
+				contentParts.push({
+					type: ContentPartType.VIDEO_URL,
+					video_url: {
+						url: `upload://${video.uploadId}`
+					}
+				});
+			} else if (video.base64Data && video.base64Data.length >= 100) {
+				// Small file — inline base64 data URL
+				contentParts.push({
+					type: ContentPartType.VIDEO_URL,
+					video_url: {
+						url: `data:${video.mimeType};base64,${video.base64Data}`
+					}
+				});
+			} else {
+				console.error(`[ChatService] Skipping video "${video.name}": no uploadId and base64Data is missing or too small (${video.base64Data?.length ?? 0} chars). Please re-upload the file.`);
+			}
 		}
 
 		const pdfFiles = message.extra.filter(

@@ -13,6 +13,7 @@
 #include <random>
 #include <sstream>
 #include <fstream>
+#include <filesystem>
 
 json format_error_response(const std::string & message, const enum error_type type) {
     std::string type_str;
@@ -83,6 +84,59 @@ std::string gen_chatcmplid() {
 
 std::string gen_tool_call_id() {
     return random_string();
+}
+
+// ============================================================================
+// Video upload store — manages streaming-uploaded temp files
+// ============================================================================
+
+video_upload_store g_video_uploads;
+
+std::string video_upload_store::add(const std::string & tmp_path, const std::string & filename,
+                                    const std::string & content_type, size_t size) {
+    std::string id = "vid_" + random_string();
+    video_upload_entry entry;
+    entry.id           = id;
+    entry.tmp_path     = tmp_path;
+    entry.filename     = filename;
+    entry.content_type = content_type;
+    entry.size         = size;
+    entry.created_at   = (int64_t)std::time(nullptr);
+
+    std::lock_guard<std::mutex> lock(mtx);
+    entries[id] = std::move(entry);
+    return id;
+}
+
+std::string video_upload_store::resolve(const std::string & id) const {
+    std::lock_guard<std::mutex> lock(mtx);
+    auto it = entries.find(id);
+    if (it == entries.end()) return "";
+    return it->second.tmp_path;
+}
+
+void video_upload_store::remove(const std::string & id) {
+    std::lock_guard<std::mutex> lock(mtx);
+    auto it = entries.find(id);
+    if (it != entries.end()) {
+        std::error_code ec;
+        std::filesystem::remove(it->second.tmp_path, ec);
+        entries.erase(it);
+    }
+}
+
+void video_upload_store::cleanup(int ttl_seconds) {
+    int64_t now = (int64_t)std::time(nullptr);
+    std::lock_guard<std::mutex> lock(mtx);
+    for (auto it = entries.begin(); it != entries.end(); ) {
+        if (now - it->second.created_at > ttl_seconds) {
+            std::error_code ec;
+            std::filesystem::remove(it->second.tmp_path, ec);
+            it = entries.erase(it);
+        } else {
+            ++it;
+        }
+    }
 }
 
 //
@@ -1019,7 +1073,8 @@ json oaicompat_chat_params_parse(
 
                 json video_url_obj = json_value(p, "video_url", json::object());
                 std::string url = json_value(video_url_obj, "url", std::string());
-                int max_frames = json_value(video_url_obj, "max_frames", 15);
+                int max_frames = json_value(video_url_obj, "max_frames", 0);   // 0 = auto (fps-based)
+                float fps = json_value(video_url_obj, "fps", 0.0f);            // 0 = default 2.0 fps
                 float scene_threshold = json_value(video_url_obj, "scene_threshold", 0.3f);
 
                 // Resolve URL to local path
@@ -1033,11 +1088,64 @@ json oaicompat_chat_params_parse(
                         throw std::invalid_argument("file path is not allowed: " + file_path);
                     }
                     local_path = opt.media_path + file_path;
+                } else if (string_starts_with(url, "data:video/")) {
+                    // Decode base64 data URL to temp file
+                    auto comma_pos = url.find(',');
+                    if (comma_pos == std::string::npos) {
+                        throw std::invalid_argument("invalid data URL for video");
+                    }
+                    std::string base64_data = url.substr(comma_pos + 1);
+
+                    // Determine extension from mime type
+                    std::string ext = ".mp4";
+                    auto semi_pos = url.find(';');
+                    if (semi_pos != std::string::npos) {
+                        std::string mime = url.substr(5, semi_pos - 5); // after "data:"
+                        if (mime == "video/webm") ext = ".webm";
+                        else if (mime == "video/quicktime") ext = ".mov";
+                        else if (mime == "video/x-msvideo") ext = ".avi";
+                        else if (mime == "video/x-matroska" || mime == "video/mkv") ext = ".mkv";
+                    }
+
+                    // Decode base64
+                    if (base64_data.size() < 16) {
+                        throw std::runtime_error("Video base64 data is too small (" + std::to_string(base64_data.size()) + " chars) - possible client-side encoding error");
+                    }
+                    std::vector<uint8_t> decoded = base64_decode(base64_data);
+                    if (decoded.size() < 1024) {
+                        throw std::runtime_error("Decoded video data too small (" + std::to_string(decoded.size()) + " bytes) - the upload may be corrupted");
+                    }
+
+                    // Write to temp file using filesystem path (avoids mixed-separator issues on Windows)
+                    {
+                        std::filesystem::path tmp_fspath =
+                            std::filesystem::temp_directory_path() / ("llama_video_upload" + ext);
+                        local_path = tmp_fspath.u8string();
+                        std::ofstream tmp_file(tmp_fspath, std::ios::binary);
+                        if (!tmp_file.is_open()) {
+                            throw std::runtime_error("Failed to create temp video file: " + local_path);
+                        }
+                        tmp_file.write(reinterpret_cast<const char *>(decoded.data()), decoded.size());
+                        if (!tmp_file.good()) {
+                            tmp_file.close();
+                            throw std::runtime_error("Failed to write video data to: " + local_path);
+                        }
+                        tmp_file.close();
+                    }
+                    SRV_INF("video data URL decoded to temp: %s (%zu bytes)\n", local_path.c_str(), decoded.size());
+                } else if (string_starts_with(url, "upload://")) {
+                    // Resolve streaming upload reference
+                    std::string upload_id = url.substr(9); // after "upload://"
+                    local_path = g_video_uploads.resolve(upload_id);
+                    if (local_path.empty()) {
+                        throw std::invalid_argument("upload not found or expired: " + upload_id);
+                    }
+                    SRV_INF("resolved upload://%s → %s\n", upload_id.c_str(), local_path.c_str());
                 } else if (string_starts_with(url, "http")) {
                     // Download to temp file
                     common_remote_params params;
-                    params.max_size = 1024 * 1024 * 200; // 200MB for video
-                    params.timeout  = 120; // 2 min for video download
+                    params.max_size = (size_t)2 * 1024 * 1024 * 1024; // 2GB for video
+                    params.timeout  = 300; // 5 min for video download
                     SRV_INF("downloading video from '%s'\n", url.c_str());
                     auto res = common_remote_get_content(url, params);
                     if (200 <= res.first && res.first < 300) {
@@ -1061,12 +1169,13 @@ json oaicompat_chat_params_parse(
                 }
 
                 // Extract video frames
-                auto * video = mtmd_video_load(local_path.c_str(), max_frames, scene_threshold);
+                auto * video = mtmd_video_load(local_path.c_str(), max_frames, fps, scene_threshold);
                 if (!video) {
                     throw std::runtime_error("Failed to extract frames from video: " + local_path);
                 }
 
-                SRV_INF("extracted %d frames from video (duration=%.1fs)\n", video->n_frames, video->duration_sec);
+                SRV_INF("extracted %d frames from video (duration=%.1fs, sample_fps=%.2f)\n",
+                        video->n_frames, video->duration_sec, video->sample_fps);
 
                 // Load each frame PNG into out_files as raw buffers and record video frame metadata
                 int n_total = video->n_frames;

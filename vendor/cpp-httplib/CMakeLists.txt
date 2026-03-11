@@ -25,6 +25,8 @@ target_compile_features(${TARGET} PRIVATE cxx_std_17)
 target_compile_definitions(${TARGET} PRIVATE
     # increase max payload length to allow use of larger context size
     CPPHTTPLIB_FORM_URL_ENCODED_PAYLOAD_MAX_LENGTH=1048576
+    # increase payload max to 2GB for large video uploads
+    CPPHTTPLIB_PAYLOAD_MAX_LENGTH=2147483648
     # increase backlog size to avoid connection resets for >> 1 slots
     CPPHTTPLIB_LISTEN_BACKLOG=512
     # increase max URI length to handle longer prompts in query string

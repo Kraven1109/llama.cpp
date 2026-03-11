@@ -26,18 +26,26 @@ struct mtmd_video {
     struct mtmd_video_frame * frames;
     int    n_frames;
     float  duration_sec;
+    float  sample_fps;        // actual sampling fps used
     char * tmp_dir;           // temp directory with frame PNGs (cleaned up on free)
 };
 
 // Load video and extract frames using ffmpeg subprocess
 // video_path: path to video file (local)
-// max_frames: maximum number of frames to extract (default: 15)
-// scene_threshold: scene change detection threshold 0.0-1.0 (default: 0.3)
+// max_frames: maximum number of frames to extract (0 = auto based on fps, capped at 120)
+// fps:        target frames per second (0.0 = use default 2.0 fps, matching Qwen2.5-VL native)
+// scene_threshold: scene change detection threshold 0.0-1.0 (reserved, unused)
 // returns nullptr on failure
 // NOTE: ffmpeg must be available in PATH
+//
+// Frame count logic (matching Qwen2.5-VL official implementation):
+//   nframes = duration * fps  (default fps=2.0)
+//   nframes = max(4, min(nframes, max_frames))
+//   nframes rounded to nearest even number (FRAME_FACTOR=2)
 MTMD_API struct mtmd_video * mtmd_video_load(
     const char * video_path,
     int          max_frames,
+    float        fps,
     float        scene_threshold);
 
 // Free video and all its frames, also cleans up temp directory

@@ -85,6 +85,53 @@ export async function parseFilesToMessageExtras(
 			} catch (error) {
 				console.error(`Failed to process audio file ${file.name}:`, error);
 			}
+		} else if (getFileTypeCategory(file.type) === FileTypeCategory.VIDEO) {
+			// Process video files
+			// For large files (>50MB), use streaming multipart upload to avoid base64 overhead
+			const LARGE_VIDEO_THRESHOLD = 50 * 1024 * 1024; // 50MB
+			try {
+				if (file.file.size > LARGE_VIDEO_THRESHOLD) {
+					// Streaming upload — binary, no base64 overhead, no full RAM buffering
+					const formData = new FormData();
+					formData.append('video', file.file, file.name);
+
+					const uploadRes = await fetch('./v1/upload/video', {
+						method: 'POST',
+						body: formData,
+					});
+
+					if (!uploadRes.ok) {
+						const errText = await uploadRes.text();
+						throw new Error(`Upload failed (${uploadRes.status}): ${errText}`);
+					}
+
+					const uploadData = await uploadRes.json();
+					extras.push({
+						type: AttachmentType.VIDEO,
+						name: file.name,
+						base64Data: '', // not stored for large files
+						mimeType: file.type,
+						uploadId: uploadData.id,
+					});
+				} else {
+					// Small files — base64 inline (stored in IndexedDB for replay)
+					const base64Data = await readFileAsBase64(file.file);
+
+					if (!base64Data || base64Data.length === 0) {
+						console.error(`Failed to read video file ${file.name}: empty base64 data`);
+						continue;
+					}
+
+					extras.push({
+						type: AttachmentType.VIDEO,
+						name: file.name,
+						base64Data: base64Data,
+						mimeType: file.type
+					});
+				}
+			} catch (error) {
+				console.error(`Failed to process video file ${file.name}:`, error);
+			}
 		} else if (getFileTypeCategory(file.type) === FileTypeCategory.PDF) {
 			try {
 				// Always get base64 data for preview functionality

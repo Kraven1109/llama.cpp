@@ -1,0 +1,1863 @@
+diff --git a/convert_hf_to_gguf.py b/convert_hf_to_gguf.py
+index 083b5bca9..788835065 100755
+--- a/convert_hf_to_gguf.py
++++ b/convert_hf_to_gguf.py
+@@ -3588,7 +3588,8 @@ class Qwen2Model(TextModel):
+             name = name.replace("language_model.", "") # for InternVL
+         if name.startswith("mlp") or name.startswith("multi_modal_projector") \
+                 or name.startswith("vision_model") or name.startswith("audio_tower") \
+-                or name.startswith("model.vision_tower") or name.startswith("model.multi_modal_projector"):
++                or name.startswith("model.vision_tower") or name.startswith("model.multi_modal_projector") \
++                or name.startswith("vit_large_projector"):
+             # skip vision and audio tensors
+             return
+         yield from super().modify_tensors(data_torch, name, bid)
+@@ -11739,6 +11740,111 @@ class YoutuVLVisionModel(MmprojModel):
+             return
+ 
+ 
++@ModelBase.register("StepVLForConditionalGeneration", "Step3VLForCausalLM", "Step3VLBaseForCausalLM")
++class Step3VLMmprojModel(MmprojModel):
++    # Step3-VL: PE-lang 1.8B ViT encoder with 2D RoPE + abs pos embd, two stride-2 Conv2d downsamplers, linear projector
++    # Architecture: 47 transformer blocks, hidden_size=1536, 16 heads, patch_size=14, image_size=728
++    # Projector: Conv2d(1536→3072, 3×3, s2) → Conv2d(3072→6144, 3×3, s2) → Linear(6144→4096)
++    # NO activations between projector layers
++
++    # Standard CLIP normalization values used by Step3-VL
++    _DEFAULT_IMAGE_MEAN = [0.48145466, 0.4578275, 0.40821073]
++    _DEFAULT_IMAGE_STD  = [0.26862954, 0.26130258, 0.27577711]
++
++    def get_vision_config(self) -> dict[str, Any] | None:
++        vision_config = self.global_config.get("vision_config")
++        if vision_config is None:
++            return None
++        width = vision_config["width"]
++        mlp_ratio = vision_config.get("mlp_ratio", 4.0)
++        return {
++            **vision_config,
++            "hidden_size": width,
++            "intermediate_size": round(width * mlp_ratio),
++            "num_hidden_layers": vision_config["layers"],
++            "num_attention_heads": vision_config["heads"],
++        }
++
++    def set_gguf_parameters(self):
++        hparams = self.hparams_vision
++        assert hparams is not None
++
++        # Provide default image normalization BEFORE super() which reads them
++        if "image_mean" not in self.preprocessor_config:
++            self.preprocessor_config["image_mean"] = self._DEFAULT_IMAGE_MEAN
++        if "image_std" not in self.preprocessor_config:
++            self.preprocessor_config["image_std"] = self._DEFAULT_IMAGE_STD
++
++        super().set_gguf_parameters()
++        self.gguf_writer.add_clip_projector_type(gguf.VisionProjectorType.STEP3VL)
++
++        # LayerNorm epsilon (standard default for CLIP-style ViT)
++        self.gguf_writer.add_vision_attention_layernorm_eps(
++            hparams.get("layer_norm_eps", 1e-5))
++
++        # 2D RoPE: theta=10000.0, interleave_freq=false
++        # The C++ side reads rope_freq_base from GGUF metadata
++        rope_theta = hparams.get("rope_theta", 10000.0)
++        self.gguf_writer.add_rope_freq_base(rope_theta)
++
++        # Do NOT set use_gelu or use_silu — default FFN_GELU_QUICK matches Step3-VL's quick_gelu
++
++    def tensor_force_quant(self, name, new_name, bid, n_dims):
++        if ".position_embd.weight" in new_name:
++            return gguf.GGMLQuantizationType.F32
++        # Keep projector Conv2d and Linear in high precision
++        if new_name.startswith("mm."):
++            return gguf.GGMLQuantizationType.F16 if self.ftype == gguf.LlamaFileType.MOSTLY_F16 else gguf.GGMLQuantizationType.F32
++        return super().tensor_force_quant(name, new_name, bid, n_dims)
++
++    def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
++        # Filter to only vision encoder + projector tensors
++        # Step3-VL uses bare "vision_model." prefix (no "model." prefix) for vision tensors
++        if not (name.startswith("vision_model.") or name.startswith("vit_large_projector.")):
++            return
++
++        # Handle positional_embedding (no .weight suffix in HF checkpoint)
++        if "positional_embedding" in name and not name.endswith((".weight", ".bias")):
++            name += ".weight"
++
++        # Handle layer scale .gamma suffix → .weight
++        if name.endswith(".gamma"):
++            name = name[:-len(".gamma")] + ".weight"
++
++        # Handle fused QKV: in_proj_weight/bias → split into q/k/v
++        if "attn.in_proj_" in name:
++            is_weight = "in_proj_weight" in name
++            suffix = "weight" if is_weight else "bias"
++            c3 = data_torch.shape[0]
++            assert c3 % 3 == 0
++            c = c3 // 3
++            wq = data_torch[:c]
++            wk = data_torch[c:c * 2]
++            wv = data_torch[c * 2:]
++            base = name.replace(f"in_proj_{suffix}", "")
++            yield from super().modify_tensors(wq, base + f"q.{suffix}", bid)
++            yield from super().modify_tensors(wk, base + f"k.{suffix}", bid)
++            yield from super().modify_tensors(wv, base + f"v.{suffix}", bid)
++            return
++
++        # Handle projector tensors → mm.N naming for C++ clip.cpp
++        if "vit_downsampler1" in name:
++            suffix = ".weight" if name.endswith(".weight") else ".bias"
++            yield ("mm.0" + suffix, data_torch)
++            return
++        if "vit_downsampler2" in name:
++            suffix = ".weight" if name.endswith(".weight") else ".bias"
++            yield ("mm.1" + suffix, data_torch)
++            return
++        if "vit_large_projector" in name:
++            suffix = ".weight" if name.endswith(".weight") else ".bias"
++            yield ("mm.2" + suffix, data_torch)
++            return
++
++        # Standard mapping for all other vision encoder tensors
++        yield from super().modify_tensors(data_torch, name, bid)
++
++
+ @ModelBase.register("SolarOpenForCausalLM")
+ class SolarOpenModel(Glm4MoeModel):
+     model_arch = gguf.MODEL_ARCH.GLM4_MOE
+diff --git a/gguf-py/gguf/constants.py b/gguf-py/gguf/constants.py
+index c5f546950..dff53f13a 100644
+--- a/gguf-py/gguf/constants.py
++++ b/gguf-py/gguf/constants.py
+@@ -3896,6 +3896,7 @@ class VisionProjectorType:
+     GLM4V = "glm4v"
+     YOUTUVL = "youtuvl"
+     NEMOTRON_V2_VL = "nemotron_v2_vl"
++    STEP3VL = "step3vl"
+ 
+ 
+ # Items here are (block size, type size)
+diff --git a/gguf-py/gguf/tensor_mapping.py b/gguf-py/gguf/tensor_mapping.py
+index e57561090..f87d36236 100644
+--- a/gguf-py/gguf/tensor_mapping.py
++++ b/gguf-py/gguf/tensor_mapping.py
+@@ -1371,6 +1371,7 @@ class TensorNameMap:
+             "model.vision.patch_embedding.proj", # cogvlm
+             "siglip2.vision_model.embeddings.patch_embedding",
+             "vision_model.radio_model.model.patch_generator.embedder", # Nemotron Nano v2 VL
++            "vision_model.conv1", # Step3-VL
+         ),
+ 
+         MODEL_TENSOR.V_ENC_EMBD_NORM: (
+@@ -1388,6 +1389,7 @@ class TensorNameMap:
+             "model.vision.patch_embedding.position_embedding", # cogvlm
+             "visual.embeddings.position_embedding", # glm4v
+             "vision_model.radio_model.model.patch_generator.pos_embed", # Nemotron Nano v2 VL
++            "vision_model.positional_embedding", # Step3-VL (no .weight suffix, handled in modify_tensors)
+         ),
+ 
+         MODEL_TENSOR.V_ENC_ATTN_QKV: (
+@@ -1408,6 +1410,7 @@ class TensorNameMap:
+             "visual.blocks.{bid}.attn.q", # qwen2vl, generated
+             "vision_tower.encoder.blocks.{bid}.wq", # kimi-vl, generated
+             "siglip2.vision_model.encoder.layers.{bid}.self_attn.q_proj", # youtuvl
++            "vision_model.transformer.resblocks.{bid}.attn.q", # Step3-VL, generated from fused QKV
+         ),
+ 
+         MODEL_TENSOR.V_ENC_ATTN_Q_NORM: (
+@@ -1427,6 +1430,7 @@ class TensorNameMap:
+             "visual.blocks.{bid}.attn.k", # qwen2vl, generated
+             "vision_tower.encoder.blocks.{bid}.wk", # kimi-vl, generated
+             "siglip2.vision_model.encoder.layers.{bid}.self_attn.k_proj",
++            "vision_model.transformer.resblocks.{bid}.attn.k", # Step3-VL, generated from fused QKV
+         ),
+ 
+         MODEL_TENSOR.V_ENC_ATTN_K_NORM: (
+@@ -1446,6 +1450,7 @@ class TensorNameMap:
+             "visual.blocks.{bid}.attn.v", # qwen2vl, generated
+             "vision_tower.encoder.blocks.{bid}.wv", # kimi-vl, generated
+             "siglip2.vision_model.encoder.layers.{bid}.self_attn.v_proj",
++            "vision_model.transformer.resblocks.{bid}.attn.v", # Step3-VL, generated from fused QKV
+         ),
+ 
+         MODEL_TENSOR.V_ENC_INPUT_NORM: (
+@@ -1462,6 +1467,7 @@ class TensorNameMap:
+             "model.vision.transformer.layers.{bid}.input_layernorm", # cogvlm
+             "siglip2.vision_model.encoder.layers.{bid}.layer_norm1",
+             "vision_model.radio_model.model.blocks.{bid}.norm1", # Nemotron Nano v2 VL
++            "vision_model.transformer.resblocks.{bid}.ln_1", # Step3-VL
+         ),
+ 
+         MODEL_TENSOR.V_ENC_ATTN_O: (
+@@ -1479,6 +1485,7 @@ class TensorNameMap:
+             "model.vision.transformer.layers.{bid}.attention.dense", # cogvlm
+             "siglip2.vision_model.encoder.layers.{bid}.self_attn.out_proj", # youtuvl
+             "vision_model.radio_model.model.blocks.{bid}.attn.proj", # Nemotron Nano v2 VL
++            "vision_model.transformer.resblocks.{bid}.attn.out_proj", # Step3-VL
+         ),
+ 
+         MODEL_TENSOR.V_ENC_POST_ATTN_NORM: (
+@@ -1495,6 +1502,7 @@ class TensorNameMap:
+             "model.vision.transformer.layers.{bid}.post_attention_layernorm", # cogvlm
+             "siglip2.vision_model.encoder.layers.{bid}.layer_norm2",
+             "vision_model.radio_model.model.blocks.{bid}.norm2", # Nemotron Nano v2 VL
++            "vision_model.transformer.resblocks.{bid}.ln_2", # Step3-VL
+         ),
+ 
+         MODEL_TENSOR.V_ENC_FFN_UP: (
+@@ -1512,6 +1520,7 @@ class TensorNameMap:
+             "model.vision.transformer.layers.{bid}.mlp.fc1", # cogvlm
+             "siglip2.vision_model.encoder.layers.{bid}.mlp.fc1",
+             "vision_model.radio_model.model.blocks.{bid}.mlp.fc1", # Nemotron Nano v2 VL
++            "vision_model.transformer.resblocks.{bid}.mlp.c_fc", # Step3-VL
+         ),
+ 
+         MODEL_TENSOR.V_ENC_FFN_GATE: (
+@@ -1535,16 +1544,19 @@ class TensorNameMap:
+             "model.vision.transformer.layers.{bid}.mlp.fc2", # cogvlm
+             "siglip2.vision_model.encoder.layers.{bid}.mlp.fc2",
+             "vision_model.radio_model.model.blocks.{bid}.mlp.fc2", # Nemotron Nano v2 VL
++            "vision_model.transformer.resblocks.{bid}.mlp.c_proj", # Step3-VL
+         ),
+ 
+         MODEL_TENSOR.V_LAYER_SCALE_1: (
+             "vision_tower.vision_model.encoder.layers.{bid}.ls1", # InternVL
+             "model.vision_tower.encoder.layer.{bid}.lambda_1", # Intern-S1
++            "vision_model.transformer.resblocks.{bid}.ls_1", # Step3-VL (.gamma suffix handled in modify_tensors)
+         ),
+ 
+         MODEL_TENSOR.V_LAYER_SCALE_2: (
+             "vision_tower.vision_model.encoder.layers.{bid}.ls2", # InternVL
+             "model.vision_tower.encoder.layer.{bid}.lambda_2", # Intern-S1
++            "vision_model.transformer.resblocks.{bid}.ls_2", # Step3-VL (.gamma suffix handled in modify_tensors)
+         ),
+ 
+         MODEL_TENSOR.V_PRE_NORM: (
+@@ -1552,6 +1564,7 @@ class TensorNameMap:
+             "vision_tower.ln_pre", # pixtral-hf
+             "vision_encoder.ln_pre", # pixtral
+             "vision_model.layernorm_pre", # llama4
++            "vision_model.ln_pre", # Step3-VL
+         ),
+ 
+         MODEL_TENSOR.V_POST_NORM: (
+diff --git a/tests/test_video_support.py b/tests/test_video_support.py
+new file mode 100644
+index 000000000..7ca1bf209
+--- /dev/null
++++ b/tests/test_video_support.py
+@@ -0,0 +1,487 @@
++"""
++Test script for llama.cpp video support with Qwen3.5-VL.
++
++Tests:
++1. Video frame extraction (mtmd_video_load via ffmpeg)
++2. Server video_url API endpoint
++3. End-to-end video inference with Qwen3.5-VL model
++
++Requirements:
++  - ffmpeg/ffprobe in PATH
++  - llama-server built with video support
++  - Qwen3.5-VL GGUF model + mmproj
++
++Usage:
++  uv run tests/test_video_support.py [--server-url URL] [--video-path PATH]
++"""
++
++import argparse
++import json
++import os
++import re
++import subprocess
++import sys
++import time
++import urllib.request
++
++# ============================================================================
++# Configuration
++# ============================================================================
++
++DEFAULT_SERVER_URL = "http://127.0.0.1:8080"
++DEFAULT_MODEL_PATH = r"E:\llm\qwen3.5-VL-9b-opus46d-abl.Q6_K.gguf"
++DEFAULT_MMPROJ_PATH = r"E:\llm\qwen3.5-VL-9b-mmproj.BF16.gguf"
++DEFAULT_VIDEO_PATH = r"D:\quang_dev\automarking\courses\genai_2025\outputs\012008010426\KiềuNgọcAnh_4289055_assignsubmission_file\20260311-100632\work\AI&App_KieuNgocAnh\presAI_KieuNgocAnh.mp4"
++BUILD_DIR = r"D:\Apps\git_cloned_repos\llama.cpp\build-cuda\bin"
++
++
++def log(msg: str, level: str = "INFO"):
++    print(f"[{level}] {msg}", flush=True)
++
++
++def log_pass(msg: str):
++    print(f"  \u2705 PASS: {msg}", flush=True)
++
++
++def log_fail(msg: str):
++    print(f"  \u274c FAIL: {msg}", flush=True)
++
++
++# ============================================================================
++# Test 1: FFmpeg availability
++# ============================================================================
++
++def test_ffmpeg_available() -> bool:
++    """Check that ffmpeg and ffprobe are available in PATH."""
++    log("Test 1: Checking ffmpeg/ffprobe availability...")
++    passed = True
++
++    for tool in ["ffmpeg", "ffprobe"]:
++        try:
++            result = subprocess.run(
++                [tool, "-version"],
++                capture_output=True,
++                text=True,
++                timeout=10,
++            )
++            if result.returncode == 0:
++                version_line = result.stdout.split("\n")[0]
++                log_pass(f"{tool} found: {version_line}")
++            else:
++                log_fail(f"{tool} returned error code {result.returncode}")
++                passed = False
++        except FileNotFoundError:
++            log_fail(f"{tool} not found in PATH")
++            passed = False
++        except Exception as e:
++            log_fail(f"{tool} check failed: {e}")
++            passed = False
++
++    return passed
++
++
++# ============================================================================
++# Test 2: Video frame extraction (standalone)
++# ============================================================================
++
++def test_frame_extraction(video_path: str) -> bool:
++    """Test that ffmpeg can extract frames from the video file."""
++    log(f"Test 2: Testing frame extraction from: {video_path}")
++
++    if not os.path.exists(video_path):
++        log_fail(f"Video file not found: {video_path}")
++        return False
++
++    # Get video duration
++    try:
++        result = subprocess.run(
++            [
++                "ffprobe", "-v", "error",
++                "-show_entries", "format=duration",
++                "-of", "default=noprint_wrappers=1:nokey=1",
++                video_path,
++            ],
++            capture_output=True,
++            text=True,
++            timeout=30,
++        )
++        duration = float(result.stdout.strip())
++        log_pass(f"Video duration: {duration:.1f}s")
++    except Exception as e:
++        log_fail(f"Could not get video duration: {e}")
++        return False
++
++    # Get video resolution
++    try:
++        result = subprocess.run(
++            [
++                "ffprobe", "-v", "error",
++                "-select_streams", "v:0",
++                "-show_entries", "stream=width,height",
++                "-of", "csv=p=0",
++                video_path,
++            ],
++            capture_output=True,
++            text=True,
++            timeout=30,
++        )
++        width, height = result.stdout.strip().split(",")
++        log_pass(f"Video resolution: {width}x{height}")
++    except Exception as e:
++        log_fail(f"Could not get video resolution: {e}")
++        return False
++
++    # Extract test frames to temp dir
++    import tempfile
++    with tempfile.TemporaryDirectory() as tmp_dir:
++        max_frames = 5
++        target_fps = max_frames / duration
++        if target_fps > 30:
++            target_fps = 30
++
++        cmd = [
++            "ffmpeg", "-i", video_path, "-y",
++            "-vf", f"fps={target_fps:.4f}",
++            "-frames:v", str(max_frames),
++            os.path.join(tmp_dir, "frame_%04d.png"),
++        ]
++
++        try:
++            result = subprocess.run(
++                cmd,
++                capture_output=True,
++                text=True,
++                timeout=120,
++            )
++            frames = [f for f in os.listdir(tmp_dir) if f.startswith("frame_")]
++            if len(frames) > 0:
++                log_pass(f"Extracted {len(frames)} frames")
++                for f in sorted(frames):
++                    fpath = os.path.join(tmp_dir, f)
++                    fsize = os.path.getsize(fpath)
++                    log_pass(f"  {f}: {fsize} bytes")
++            else:
++                log_fail("No frames extracted")
++                return False
++        except Exception as e:
++            log_fail(f"Frame extraction failed: {e}")
++            return False
++
++    return True
++
++
++# ============================================================================
++# Test 3: Server health check
++# ============================================================================
++
++def test_server_health(server_url: str) -> bool:
++    """Check the server is running and supports vision."""
++    log(f"Test 3: Server health check at {server_url}...")
++
++    try:
++        req = urllib.request.Request(f"{server_url}/health")
++        with urllib.request.urlopen(req, timeout=10) as resp:
++            data = json.loads(resp.read().decode())
++            status = data.get("status", "unknown")
++            if status == "ok":
++                log_pass(f"Server healthy: {data}")
++                return True
++            else:
++                log_fail(f"Server status: {status}")
++                return False
++    except Exception as e:
++        log_fail(f"Server not reachable: {e}")
++        return False
++
++
++# ============================================================================
++# Test 4: Image API (baseline - existing functionality)
++# ============================================================================
++
++def test_image_api(server_url: str) -> bool:
++    """Test that the existing image_url API works (baseline)."""
++    log("Test 4: Testing existing image_url API (baseline)...")
++
++    # Create a simple 2x2 red PNG (minimal valid PNG)
++    import base64
++    # Minimal 2x2 red PNG in base64
++    red_png_b64 = (
++        "iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAADklEQVQI12P4z8BQDwAEgAF/"
++        "QualIQAAAABJRU5ErkJggg=="
++    )
++
++    payload = {
++        "model": "test",
++        "messages": [
++            {
++                "role": "user",
++                "content": [
++                    {
++                        "type": "image_url",
++                        "image_url": {
++                            "url": f"data:image/png;base64,{red_png_b64}",
++                        },
++                    },
++                    {
++                        "type": "text",
++                        "text": "What do you see in this image? Reply in one sentence.",
++                    },
++                ],
++            }
++        ],
++        "max_tokens": 100,
++        "temperature": 0.1,
++    }
++
++    try:
++        data = json.dumps(payload).encode()
++        req = urllib.request.Request(
++            f"{server_url}/v1/chat/completions",
++            data=data,
++            headers={"Content-Type": "application/json"},
++        )
++        with urllib.request.urlopen(req, timeout=120) as resp:
++            result = json.loads(resp.read().decode())
++            content = result["choices"][0]["message"]["content"]
++            log_pass(f"Image API response: {content[:100]}")
++            return True
++    except Exception as e:
++        log_fail(f"Image API failed: {e}")
++        return False
++
++
++# ============================================================================
++# Test 5: Video URL API
++# ============================================================================
++
++def test_video_api(server_url: str, video_path: str) -> bool:
++    """Test the new video_url API endpoint."""
++    log(f"Test 5: Testing video_url API with: {video_path}")
++
++    if not os.path.exists(video_path):
++        log_fail(f"Video file not found: {video_path}")
++        return False
++
++    payload = {
++        "model": "test",
++        "messages": [
++            {
++                "role": "user",
++                "content": [
++                    {
++                        "type": "video_url",
++                        "video_url": {
++                            "url": video_path,
++                            "max_frames": 5,
++                        },
++                    },
++                    {
++                        "type": "text",
++                        "text": "Describe what you see in this video. What is the main topic being presented?",
++                    },
++                ],
++            }
++        ],
++        "max_tokens": 300,
++        "temperature": 0.1,
++    }
++
++    try:
++        data = json.dumps(payload).encode()
++        req = urllib.request.Request(
++            f"{server_url}/v1/chat/completions",
++            data=data,
++            headers={"Content-Type": "application/json"},
++        )
++        with urllib.request.urlopen(req, timeout=300) as resp:
++            result = json.loads(resp.read().decode())
++            content = result["choices"][0]["message"]["content"]
++            log_pass(f"Video API response ({len(content)} chars):")
++            print(f"    {content[:300]}")
++
++            # Basic sanity: response should be non-trivial
++            if len(content) > 20:
++                log_pass("Response is non-trivial (>20 chars)")
++            else:
++                log_fail("Response too short, model may not have understood the video")
++                return False
++
++            return True
++    except urllib.error.HTTPError as e:
++        error_body = e.read().decode() if e.fp else ""
++        log_fail(f"Video API HTTP error {e.code}: {error_body[:500]}")
++        return False
++    except Exception as e:
++        log_fail(f"Video API failed: {e}")
++        return False
++
++
++# ============================================================================
++# Test 6: Video with multiple frames (stress test)
++# ============================================================================
++
++def test_video_multi_frame(server_url: str, video_path: str) -> bool:
++    """Test video with more frames to check temporal mRoPE."""
++    log(f"Test 6: Testing video with 10 frames (temporal mRoPE stress)...")
++
++    if not os.path.exists(video_path):
++        log_fail(f"Video file not found: {video_path}")
++        return False
++
++    payload = {
++        "model": "test",
++        "messages": [
++            {
++                "role": "user",
++                "content": [
++                    {
++                        "type": "video_url",
++                        "video_url": {
++                            "url": video_path,
++                            "max_frames": 10,
++                        },
++                    },
++                    {
++                        "type": "text",
++                        "text": "This is a video of a presentation. How many different slides or sections do you see? What are the main topics covered?",
++                    },
++                ],
++            }
++        ],
++        "max_tokens": 500,
++        "temperature": 0.1,
++    }
++
++    try:
++        data = json.dumps(payload).encode()
++        req = urllib.request.Request(
++            f"{server_url}/v1/chat/completions",
++            data=data,
++            headers={"Content-Type": "application/json"},
++        )
++        t0 = time.time()
++        with urllib.request.urlopen(req, timeout=600) as resp:
++            elapsed = time.time() - t0
++            result = json.loads(resp.read().decode())
++            content = result["choices"][0]["message"]["content"]
++            usage = result.get("usage", {})
++            log_pass(f"Multi-frame response in {elapsed:.1f}s:")
++            print(f"    {content[:400]}")
++            if usage:
++                log_pass(f"Token usage: prompt={usage.get('prompt_tokens')}, completion={usage.get('completion_tokens')}")
++            return len(content) > 30
++    except Exception as e:
++        log_fail(f"Multi-frame test failed: {e}")
++        return False
++
++
++# ============================================================================
++# Main
++# ============================================================================
++
++def main():
++    parser = argparse.ArgumentParser(description="Test llama.cpp video support")
++    parser.add_argument("--server-url", default=DEFAULT_SERVER_URL, help="Server URL")
++    parser.add_argument("--video-path", default=DEFAULT_VIDEO_PATH, help="Path to test video")
++    parser.add_argument("--model", default=DEFAULT_MODEL_PATH, help="Model path")
++    parser.add_argument("--mmproj", default=DEFAULT_MMPROJ_PATH, help="MMProj path")
++    parser.add_argument("--skip-server", action="store_true", help="Skip server tests")
++    parser.add_argument("--start-server", action="store_true", help="Auto-start server")
++    args = parser.parse_args()
++
++    log("=" * 60)
++    log("llama.cpp Video Support Test Suite")
++    log("=" * 60)
++
++    results = {}
++    server_proc = None
++
++    # Test 1: FFmpeg
++    results["ffmpeg"] = test_ffmpeg_available()
++    print()
++
++    # Test 2: Frame extraction
++    results["frame_extraction"] = test_frame_extraction(args.video_path)
++    print()
++
++    if not args.skip_server:
++        # Optionally start the server
++        if args.start_server:
++            log("Starting llama-server...")
++            server_bin = os.path.join(BUILD_DIR, "llama-server")
++            if os.name == "nt":
++                server_bin += ".exe"
++
++            server_cmd = [
++                server_bin,
++                "-m", args.model,
++                "--mmproj", args.mmproj,
++                "-c", "8192",
++                "-ngl", "99",
++                "--host", "0.0.0.0",
++                "--port", "8080",
++                "--jinja",
++            ]
++            log(f"Command: {' '.join(server_cmd)}")
++            server_proc = subprocess.Popen(
++                server_cmd,
++                stdout=subprocess.PIPE,
++                stderr=subprocess.PIPE,
++            )
++            log("Waiting for server to start...")
++            for i in range(60):
++                time.sleep(2)
++                try:
++                    req = urllib.request.Request(f"{args.server_url}/health")
++                    with urllib.request.urlopen(req, timeout=5) as resp:
++                        data = json.loads(resp.read().decode())
++                        if data.get("status") == "ok":
++                            log_pass(f"Server started after {(i+1)*2}s")
++                            break
++                except Exception:
++                    pass
++            else:
++                log_fail("Server did not start within 120s")
++                if server_proc:
++                    server_proc.terminate()
++                return 1
++
++        # Test 3: Server health
++        results["server_health"] = test_server_health(args.server_url)
++        print()
++
++        if results["server_health"]:
++            # Test 4: Image API baseline
++            results["image_api"] = test_image_api(args.server_url)
++            print()
++
++            # Test 5: Video API
++            results["video_api"] = test_video_api(args.server_url, args.video_path)
++            print()
++
++            # Test 6: Multi-frame
++            if results["video_api"]:
++                results["video_multi_frame"] = test_video_multi_frame(args.server_url, args.video_path)
++                print()
++
++    # Summary
++    log("=" * 60)
++    log("TEST SUMMARY")
++    log("=" * 60)
++    total = len(results)
++    passed = sum(1 for v in results.values() if v)
++    for name, result in results.items():
++        status = "\u2705 PASS" if result else "\u274c FAIL"
++        log(f"  {status}: {name}")
++
++    log(f"\nResult: {passed}/{total} tests passed")
++
++    if server_proc:
++        log("Shutting down server...")
++        server_proc.terminate()
++
++    return 0 if passed == total else 1
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/tools/mtmd/CMakeLists.txt b/tools/mtmd/CMakeLists.txt
+index 3be3c27e8..db5c44ffa 100644
+--- a/tools/mtmd/CMakeLists.txt
++++ b/tools/mtmd/CMakeLists.txt
+@@ -8,6 +8,8 @@ add_library(mtmd
+             mtmd.h
+             mtmd-helper.cpp
+             mtmd-helper.h
++            mtmd-helper-video.cpp
++            mtmd-helper-video.h
+             clip.cpp
+             clip.h
+             clip-impl.h
+@@ -29,6 +31,7 @@ add_library(mtmd
+             models/qwen2vl.cpp
+             models/qwen3vl.cpp
+             models/siglip.cpp
++            models/step3vl.cpp
+             models/whisper-enc.cpp
+             models/mobilenetv5.cpp
+             models/youtuvl.cpp
+@@ -56,6 +59,7 @@ endif()
+ set(MTMD_PUBLIC_HEADERS
+     ${CMAKE_CURRENT_SOURCE_DIR}/mtmd.h
+     ${CMAKE_CURRENT_SOURCE_DIR}/mtmd-helper.h
++    ${CMAKE_CURRENT_SOURCE_DIR}/mtmd-helper-video.h
+     )
+ 
+ set_target_properties(mtmd
+diff --git a/tools/mtmd/clip-impl.h b/tools/mtmd/clip-impl.h
+index 0c3cf8670..1dd82ae3f 100644
+--- a/tools/mtmd/clip-impl.h
++++ b/tools/mtmd/clip-impl.h
+@@ -238,6 +238,7 @@ enum projector_type {
+     PROJECTOR_TYPE_YOUTUVL,
+     PROJECTOR_TYPE_KIMIK25,
+     PROJECTOR_TYPE_NEMOTRON_V2_VL,
++    PROJECTOR_TYPE_STEP3VL,
+     PROJECTOR_TYPE_UNKNOWN,
+ };
+ 
+@@ -274,6 +275,7 @@ static std::map<projector_type, std::string> PROJECTOR_TYPE_NAMES = {
+     { PROJECTOR_TYPE_YOUTUVL,   "youtuvl"},
+     { PROJECTOR_TYPE_KIMIK25,   "kimik25"},
+     { PROJECTOR_TYPE_NEMOTRON_V2_VL, "nemotron_v2_vl"},
++    { PROJECTOR_TYPE_STEP3VL, "step3vl"},
+ };
+ 
+ static projector_type clip_projector_type_from_string(const std::string & str) {
+@@ -290,6 +292,10 @@ struct clip_image_u8 {
+     int nx;
+     int ny;
+ 
++    // Video temporal info (0 = static image, >0 = video frame index)
++    int   frame_idx     = 0;
++    float timestamp_sec = 0.0f;
++
+     std::vector<uint8_t> buf;
+ };
+ 
+diff --git a/tools/mtmd/clip.cpp b/tools/mtmd/clip.cpp
+index b70bad33b..fd6367dde 100644
+--- a/tools/mtmd/clip.cpp
++++ b/tools/mtmd/clip.cpp
+@@ -873,6 +873,10 @@ static ggml_cgraph * clip_image_build_graph(clip_ctx * ctx, const clip_image_f32
+             {
+                 builder = std::make_unique<clip_graph_youtuvl>(ctx, img);
+             } break;
++        case PROJECTOR_TYPE_STEP3VL:
++            {
++                builder = std::make_unique<clip_graph_step3vl>(ctx, img);
++            } break;
+         default:
+             GGML_ABORT("missing cgraph builder");
+     }
+@@ -1234,6 +1238,13 @@ struct clip_model_loader {
+                         hparams.set_limit_image_tokens(8, 4096);
+                         hparams.set_warmup_n_tokens(46*46); // avoid OOM on warmup
+                     } break;
++                case PROJECTOR_TYPE_STEP3VL:
++                    {
++                        // Step3-VL: 2D RoPE with theta=10000, two stride-2 Conv2d downsamplers (4x spatial reduction per dim)
++                        hparams.rope_theta = 10000.0f;
++                        // image_size=728, patch_size=14 → 52×52 patches → after 2 downsamplers → 13×13 = 169 tokens
++                        hparams.set_warmup_n_tokens(52*52);
++                    } break;
+                 case PROJECTOR_TYPE_LLAMA4:
+                     {
+                         hparams.rope_theta = 10000.0f;
+@@ -1802,6 +1813,16 @@ struct clip_model_loader {
+                     model.mm_1_w = get_tensor(string_format(TN_MVLM_PROJ_MLP, 1, "weight"));
+                     model.mm_3_w = get_tensor(string_format(TN_MVLM_PROJ_MLP, 3, "weight"));
+                 } break;
++            case PROJECTOR_TYPE_STEP3VL:
++                {
++                    // Step3-VL projector: Conv2d downsampler1 (mm.0), Conv2d downsampler2 (mm.1), Linear (mm.2)
++                    model.mm_0_w = get_tensor(string_format(TN_LLAVA_PROJ, 0, "weight"));
++                    model.mm_0_b = get_tensor(string_format(TN_LLAVA_PROJ, 0, "bias"), false);
++                    model.mm_1_w = get_tensor(string_format(TN_LLAVA_PROJ, 1, "weight"));
++                    model.mm_1_b = get_tensor(string_format(TN_LLAVA_PROJ, 1, "bias"), false);
++                    model.mm_2_w = get_tensor(string_format(TN_LLAVA_PROJ, 2, "weight"));
++                    model.mm_2_b = get_tensor(string_format(TN_LLAVA_PROJ, 2, "bias"), false);
++                } break;
+             case PROJECTOR_TYPE_GLMA:
+                 {
+                     model.conv1d_1_w = get_tensor(string_format(TN_CONV1D, 1, "weight"));
+@@ -3125,6 +3146,7 @@ bool clip_image_preprocess(struct clip_ctx * ctx, const clip_image_u8 * img, str
+         case PROJECTOR_TYPE_GEMMA3:
+         case PROJECTOR_TYPE_INTERNVL: // TODO @ngxson : support dynamic resolution
+         case PROJECTOR_TYPE_NEMOTRON_V2_VL:
++        case PROJECTOR_TYPE_STEP3VL:
+             {
+                 clip_image_u8 resized_image;
+                 int sz = params.image_size;
+@@ -3433,6 +3455,13 @@ int clip_n_output_tokens(const struct clip_ctx * ctx, struct clip_image_f32 * im
+                 int y_patch = img->ny / (params.patch_size * 2);
+                 n_patches = x_patch * y_patch;
+             } break;
++        case PROJECTOR_TYPE_STEP3VL:
++            {
++                // Step3-VL: two stride-2 Conv2d downsamplers = 4x reduction per spatial dim
++                int x_patch = img->nx / (params.patch_size * 4);
++                int y_patch = img->ny / (params.patch_size * 4);
++                n_patches = x_patch * y_patch;
++            } break;
+         case PROJECTOR_TYPE_GEMMA3:
+         case PROJECTOR_TYPE_IDEFICS3:
+         case PROJECTOR_TYPE_INTERNVL:
+@@ -3826,6 +3855,7 @@ bool clip_image_batch_encode(clip_ctx * ctx, const int n_threads, const clip_ima
+         case PROJECTOR_TYPE_KIMIVL:
+         case PROJECTOR_TYPE_KIMIK25:
+         case PROJECTOR_TYPE_LIGHTONOCR:
++        case PROJECTOR_TYPE_STEP3VL:
+             {
+                 // set the 2D positions
+                 int n_patches_per_col = image_size_width / patch_size;
+@@ -4059,6 +4089,8 @@ int clip_n_mmproj_embd(const struct clip_ctx * ctx) {
+             return ctx->model.position_embeddings->ne[0];
+         case PROJECTOR_TYPE_GLM4V:
+             return ctx->model.mm_ffn_down_w->ne[1];
++        case PROJECTOR_TYPE_STEP3VL:
++            return ctx->model.mm_2_w->ne[1]; // mm.2 is the Linear(6144→4096) projector
+         default:
+             GGML_ABORT("Unknown projector type");
+     }
+diff --git a/tools/mtmd/models/models.h b/tools/mtmd/models/models.h
+index aff222c71..87f3eebd7 100644
+--- a/tools/mtmd/models/models.h
++++ b/tools/mtmd/models/models.h
+@@ -126,3 +126,8 @@ struct clip_graph_kimik25 : clip_graph {
+ 
+     ggml_tensor * resize_position_embeddings_3d(uint32_t interpolation_mode);
+ };
++
++struct clip_graph_step3vl : clip_graph {
++    clip_graph_step3vl(clip_ctx * ctx, const clip_image_f32 & img) : clip_graph(ctx, img) {}
++    ggml_cgraph * build() override;
++};
+diff --git a/tools/mtmd/models/step3vl.cpp b/tools/mtmd/models/step3vl.cpp
+new file mode 100644
+index 000000000..68e88608f
+--- /dev/null
++++ b/tools/mtmd/models/step3vl.cpp
+@@ -0,0 +1,90 @@
++#include "models.h"
++
++// Step3-VL: PE-lang 1.8B ViT encoder with 2D RoPE + abs pos embd
++// Architecture: 47 transformer blocks, hidden_size=1536, 16 heads, patch_size=14, image_size=728
++// Projector: Conv2d(1536→3072, 3×3, s2) → Conv2d(3072→6144, 3×3, s2) → Linear(6144→4096)
++// NO activations between projector layers
++
++ggml_cgraph * clip_graph_step3vl::build() {
++    // Step3-VL uses learned positional embeddings + 2D RoPE
++    GGML_ASSERT(model.position_embeddings != nullptr);
++    GGML_ASSERT(model.class_embedding == nullptr);  // no CLS token
++
++    // 2D input positions for RoPE
++    ggml_tensor * pos_w = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_patches);
++    ggml_set_name(pos_w, "pos_w");
++    ggml_set_input(pos_w);
++
++    ggml_tensor * pos_h = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_patches);
++    ggml_set_name(pos_h, "pos_h");
++    ggml_set_input(pos_h);
++
++    // Step3-VL 2D RoPE: first d_head/2 dims get width positions, second half gets height
++    // freqs = cat([freqs_w, freqs_h], dim=-1), interleave_freq=false, theta=10000
++    auto add_pos = [&](ggml_tensor * cur, const clip_layer &) {
++        return build_rope_2d(ctx0, cur, pos_w, pos_h, hparams.rope_theta, false);
++    };
++
++    ggml_tensor * inp = build_inp();
++
++    // Build ViT with:
++    // - NORM_TYPE_NORMAL (standard LayerNorm, not RMS)
++    // - FFN_GELU_QUICK (quick_gelu activation, default when neither use_gelu nor use_silu)
++    // - Learned positional embeddings (2704 positions = 52×52 grid)
++    // - 2D RoPE callback
++    // - Layer scale (v.blk.N.ls1/ls2.weight) is handled automatically by build_vit
++    // - Pre-norm (v.pre_ln) is handled automatically by build_vit
++    ggml_tensor * cur = build_vit(
++                            inp, n_patches,
++                            NORM_TYPE_NORMAL,
++                            hparams.ffn_op,
++                            model.position_embeddings,
++                            add_pos);
++
++    // No post-LayerNorm in Step3-VL (use_ln_post=false)
++
++    // Step3-VL projector: two stride-2 Conv2d downsamplers + linear projection
++    // NO activations between layers
++    {
++        // Reshape ViT output from [n_embd, n_patches] to spatial [n_embd, W, H]
++        // where W = n_patches_x, H = n_patches_y (both 52 for 728/14)
++        cur = ggml_reshape_3d(ctx0, cur, n_embd, n_patches_x, n_patches_y);
++        // ggml_conv_2d expects [W, H, C, N] layout, but cur is [C, W, H]
++        // ggml_permute semantics: input axis i -> output axis perm[i]
++        // axis 0 (C) -> pos 2, axis 1 (W) -> pos 0, axis 2 (H) -> pos 1
++        cur = ggml_permute(ctx0, cur, 2, 0, 1, 3);
++        cur = ggml_cont(ctx0, cur);
++
++        // Downsampler 1: Conv2d(n_embd → n_embd*2, 3×3, stride=2, padding=1)
++        // mm.0.weight shape: {3, 3, n_embd, n_embd*2} in GGUF
++        cur = ggml_conv_2d(ctx0, model.mm_0_w, cur, 2, 2, 1, 1, 1, 1);
++        if (model.mm_0_b) {
++            // Reshape bias for broadcasting: [1, 1, n_embd*2, 1]
++            ggml_tensor * bias = ggml_reshape_4d(ctx0, model.mm_0_b, 1, 1, model.mm_0_b->ne[0], 1);
++            cur = ggml_add(ctx0, cur, bias);
++        }
++
++        // Downsampler 2: Conv2d(n_embd*2 → n_embd*4, 3×3, stride=2, padding=1)
++        // mm.1.weight shape: {3, 3, n_embd*2, n_embd*4} in GGUF
++        cur = ggml_conv_2d(ctx0, model.mm_1_w, cur, 2, 2, 1, 1, 1, 1);
++        if (model.mm_1_b) {
++            ggml_tensor * bias = ggml_reshape_4d(ctx0, model.mm_1_b, 1, 1, model.mm_1_b->ne[0], 1);
++            cur = ggml_add(ctx0, cur, bias);
++        }
++
++        // Reshape back to 2D: [n_embd*4, n_output_tokens]
++        // After two stride-2 downsamples: spatial dims are n_patches_x/4 × n_patches_y/4
++        const int out_x = n_patches_x / 4;
++        const int out_y = n_patches_y / 4;
++        // cur is [W_out, H_out, C_out, 1], need [C_out, W_out*H_out]
++        // axis 0 (W) -> pos 1, axis 1 (H) -> pos 2, axis 2 (C) -> pos 0
++        cur = ggml_permute(ctx0, cur, 1, 2, 0, 3);
++        cur = ggml_cont_2d(ctx0, cur, cur->ne[0], out_x * out_y);
++
++        // Linear projection: mm.2.weight shape [n_embd*4, text_hidden_size]
++        cur = ggml_mul_mat(ctx0, model.mm_2_w, cur);
++    }
++
++    ggml_build_forward_expand(gf, cur);
++    return gf;
++}
+diff --git a/tools/mtmd/mtmd-helper-video.cpp b/tools/mtmd/mtmd-helper-video.cpp
+new file mode 100644
+index 000000000..024bf456a
+--- /dev/null
++++ b/tools/mtmd/mtmd-helper-video.cpp
+@@ -0,0 +1,309 @@
++#include "mtmd-helper-video.h"
++#include "mtmd.h"
++
++#include <cmath>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <string>
++#include <vector>
++#include <algorithm>
++#include <fstream>
++#include <sstream>
++#include <filesystem>
++
++#if defined(_WIN32)
++#define WIN32_LEAN_AND_MEAN
++#ifndef NOMINMAX
++#   define NOMINMAX
++#endif
++#include <windows.h>
++#define popen  _popen
++#define pclose _pclose
++#endif
++
++// stb_image is already implemented in mtmd-helper.cpp, just include the header
++#include "stb/stb_image.h"
++
++// ============================================================================
++// Internal helpers
++// ============================================================================
++
++namespace fs = std::filesystem;
++
++static std::string create_temp_dir(const char * video_path) {
++    fs::path vpath(video_path);
++    fs::path tmp = vpath.parent_path() / (vpath.stem().string() + "_mtmd_frames");
++    std::error_code ec;
++    fs::create_directories(tmp, ec);
++    return tmp.string();
++}
++
++static void cleanup_temp_dir(const std::string & dir) {
++    std::error_code ec;
++    fs::remove_all(dir, ec);
++}
++
++// Get video duration using ffprobe - tries multiple methods
++static float get_video_duration(const char * video_path) {
++    // Method 1: format duration (container-level)
++    {
++        char cmd[2048];
++        snprintf(cmd, sizeof(cmd),
++            "ffprobe -v error -show_entries format=duration "
++            "-of default=noprint_wrappers=1:nokey=1 \"%s\"",
++            video_path);
++
++        FILE * fp = popen(cmd, "r");
++        if (fp) {
++            float duration = -1.0f;
++            if (fscanf(fp, "%f", &duration) == 1 && duration > 0.0f) {
++                pclose(fp);
++                return duration;
++            }
++            pclose(fp);
++        }
++    }
++
++    // Method 2: stream duration (more reliable for some formats)
++    {
++        char cmd[2048];
++        snprintf(cmd, sizeof(cmd),
++            "ffprobe -v error -select_streams v:0 "
++            "-show_entries stream=duration "
++            "-of default=noprint_wrappers=1:nokey=1 \"%s\"",
++            video_path);
++
++        FILE * fp = popen(cmd, "r");
++        if (fp) {
++            float duration = -1.0f;
++            if (fscanf(fp, "%f", &duration) == 1 && duration > 0.0f) {
++                pclose(fp);
++                return duration;
++            }
++            pclose(fp);
++        }
++    }
++
++    // Method 3: count frames and use frame rate
++    {
++        char cmd[2048];
++        snprintf(cmd, sizeof(cmd),
++            "ffprobe -v error -select_streams v:0 "
++            "-count_frames -show_entries stream=nb_read_frames,r_frame_rate "
++            "-of csv=p=0 \"%s\"",
++            video_path);
++
++        FILE * fp = popen(cmd, "r");
++        if (fp) {
++            char buf[256] = {};
++            if (fgets(buf, sizeof(buf), fp)) {
++                int num = 0, den = 1;
++                long n_frames = 0;
++                // Parse "fps_num/fps_den,n_frames"
++                if (sscanf(buf, "%d/%d,%ld", &num, &den, &n_frames) == 3 && den > 0 && n_frames > 0) {
++                    pclose(fp);
++                    return (float)n_frames * (float)den / (float)num;
++                }
++            }
++            pclose(fp);
++        }
++    }
++
++    fprintf(stderr, "[mtmd-video] ERROR: all duration detection methods failed\n");
++    return -1.0f;  // caller should handle this
++}
++
++// Collect sorted file paths with given prefix
++static std::vector<std::string> collect_files_sorted(const std::string & dir, const std::string & prefix) {
++    std::vector<std::string> files;
++    std::error_code ec;
++    for (const auto & entry : fs::directory_iterator(dir, ec)) {
++        if (entry.is_regular_file()) {
++            std::string fname = entry.path().filename().string();
++            if (fname.find(prefix) == 0) {
++                files.push_back(entry.path().string());
++            }
++        }
++    }
++    std::sort(files.begin(), files.end());
++    return files;
++}
++
++// Validate video path for shell safety
++static bool validate_video_path(const char * video_path) {
++    if (!video_path) return false;
++    std::string path(video_path);
++    for (char c : path) {
++        if (c == ';' || c == '|' || c == '&' || c == '`' || c == '$' || c == '\n' || c == '\r') {
++            fprintf(stderr, "[mtmd-video] ERROR: video path contains unsafe characters\n");
++            return false;
++        }
++    }
++    return true;
++}
++
++// ============================================================================
++// Frame extraction
++// ============================================================================
++
++static bool extract_frames_uniform(
++    const char * video_path,
++    const std::string & tmp_dir,
++    int max_frames,
++    float duration,
++    std::vector<std::string> & out_files)
++{
++    if (duration <= 0.0f) {
++        fprintf(stderr, "[mtmd-video] ERROR: invalid duration for frame extraction\n");
++        return false;
++    }
++
++    float target_fps = (float)max_frames / duration;
++    if (target_fps > 30.0f) target_fps = 30.0f;
++    if (target_fps < 0.1f)  target_fps = 0.1f;
++
++    char cmd[4096];
++#if defined(_WIN32)
++    snprintf(cmd, sizeof(cmd),
++        "ffmpeg -i \"%s\" -y "
++        "-vf \"fps=%.4f\" -frames:v %d "
++        "\"%s\\frame_%%04d.png\" 2>NUL",
++        video_path, target_fps, max_frames, tmp_dir.c_str());
++#else
++    snprintf(cmd, sizeof(cmd),
++        "ffmpeg -i \"%s\" -y "
++        "-vf \"fps=%.4f\" -frames:v %d "
++        "\"%s/frame_%%04d.png\" 2>/dev/null",
++        video_path, target_fps, max_frames, tmp_dir.c_str());
++#endif
++
++    int ret = system(cmd);
++    if (ret != 0) {
++        fprintf(stderr, "[mtmd-video] WARN: ffmpeg returned %d\n", ret);
++    }
++
++    out_files = collect_files_sorted(tmp_dir, "frame_");
++    return !out_files.empty();
++}
++
++// ============================================================================
++// Public API
++// ============================================================================
++
++struct mtmd_video * mtmd_video_load(
++    const char * video_path,
++    int          max_frames,
++    float        scene_threshold)
++{
++    (void)scene_threshold; // reserved for future scene-based extraction
++
++    if (!validate_video_path(video_path) || max_frames <= 0) {
++        return nullptr;
++    }
++
++    if (!fs::exists(video_path)) {
++        fprintf(stderr, "[mtmd-video] ERROR: video file not found: %s\n", video_path);
++        return nullptr;
++    }
++
++    if (max_frames > 120) max_frames = 120;
++
++    float duration = get_video_duration(video_path);
++    if (duration <= 0.0f) {
++        fprintf(stderr, "[mtmd-video] ERROR: could not determine video duration. Is ffprobe working?\n");
++        return nullptr;
++    }
++
++    fprintf(stderr, "[mtmd-video] loading video: %s (duration=%.1fs, max_frames=%d)\n",
++            video_path, duration, max_frames);
++
++    std::string tmp_dir = create_temp_dir(video_path);
++
++    std::vector<std::string> frame_files;
++    bool ok = extract_frames_uniform(video_path, tmp_dir, max_frames, duration, frame_files);
++
++    if (!ok || frame_files.empty()) {
++        fprintf(stderr, "[mtmd-video] ERROR: failed to extract any frames\n");
++        cleanup_temp_dir(tmp_dir);
++        return nullptr;
++    }
++
++    int n_frames = (int)frame_files.size();
++    float time_step = duration / (float)n_frames;
++
++    fprintf(stderr, "[mtmd-video] extracted %d frames (time_step=%.2fs)\n", n_frames, time_step);
++
++    // Build output
++    auto * video = new mtmd_video();
++    video->n_frames     = n_frames;
++    video->duration_sec = duration;
++    video->tmp_dir      = strdup(tmp_dir.c_str());
++    video->frames       = (mtmd_video_frame *)calloc(n_frames, sizeof(mtmd_video_frame));
++
++    for (int i = 0; i < n_frames; i++) {
++        auto & f = video->frames[i];
++        f.frame_index    = i;
++        f.timestamp_sec  = time_step * (i + 0.5f); // midpoint of interval
++        f.png_path       = strdup(frame_files[i].c_str());
++        f.data           = nullptr; // loaded on demand via mtmd_video_frame_read_png
++
++        // Get image dimensions
++        int nx = 0, ny = 0, nc = 0;
++        if (stbi_info(frame_files[i].c_str(), &nx, &ny, &nc)) {
++            f.nx = (uint32_t)nx;
++            f.ny = (uint32_t)ny;
++        }
++    }
++
++    return video;
++}
++
++void mtmd_video_free(struct mtmd_video * video) {
++    if (!video) return;
++
++    for (int i = 0; i < video->n_frames; i++) {
++        free(video->frames[i].data);
++        free(video->frames[i].png_path);
++    }
++    free(video->frames);
++
++    // Cleanup temp directory
++    if (video->tmp_dir) {
++        cleanup_temp_dir(video->tmp_dir);
++        free(video->tmp_dir);
++    }
++
++    delete video;
++}
++
++size_t mtmd_video_frame_read_png(const struct mtmd_video_frame * frame,
++                                 unsigned char ** out_buf)
++{
++    if (!frame || !frame->png_path || !out_buf) {
++        return 0;
++    }
++
++    std::ifstream file(frame->png_path, std::ios::binary | std::ios::ate);
++    if (!file.is_open()) {
++        fprintf(stderr, "[mtmd-video] ERROR: cannot open frame PNG: %s\n", frame->png_path);
++        return 0;
++    }
++
++    size_t size = (size_t)file.tellg();
++    file.seekg(0, std::ios::beg);
++
++    unsigned char * buf = (unsigned char *)malloc(size);
++    if (!buf) {
++        return 0;
++    }
++
++    file.read(reinterpret_cast<char *>(buf), size);
++    if (!file) {
++        free(buf);
++        return 0;
++    }
++
++    *out_buf = buf;
++    return size;
++}
+diff --git a/tools/mtmd/mtmd-helper-video.h b/tools/mtmd/mtmd-helper-video.h
+new file mode 100644
+index 000000000..fb7b2b151
+--- /dev/null
++++ b/tools/mtmd/mtmd-helper-video.h
+@@ -0,0 +1,56 @@
++#ifndef MTMD_HELPER_VIDEO_H
++#define MTMD_HELPER_VIDEO_H
++
++#include "mtmd.h"
++
++#include <stddef.h>
++#include <stdint.h>
++#include <stdbool.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++// Video frame extracted from a video file
++struct mtmd_video_frame {
++    uint32_t nx;
++    uint32_t ny;
++    float    timestamp_sec;   // timestamp in seconds
++    int      frame_index;     // 0-based frame index
++    unsigned char * data;     // RGB data, size = nx * ny * 3
++    char * png_path;          // path to PNG file on disk (for server loading)
++};
++
++// Video container holding extracted frames
++struct mtmd_video {
++    struct mtmd_video_frame * frames;
++    int    n_frames;
++    float  duration_sec;
++    char * tmp_dir;           // temp directory with frame PNGs (cleaned up on free)
++};
++
++// Load video and extract frames using ffmpeg subprocess
++// video_path: path to video file (local)
++// max_frames: maximum number of frames to extract (default: 15)
++// scene_threshold: scene change detection threshold 0.0-1.0 (default: 0.3)
++// returns nullptr on failure
++// NOTE: ffmpeg must be available in PATH
++MTMD_API struct mtmd_video * mtmd_video_load(
++    const char * video_path,
++    int          max_frames,
++    float        scene_threshold);
++
++// Free video and all its frames, also cleans up temp directory
++MTMD_API void mtmd_video_free(struct mtmd_video * video);
++
++// Read a video frame's PNG file into a raw buffer suitable for mtmd_helper_bitmap_init_from_buf
++// Returns the buffer size, or 0 on failure
++// The caller must free the returned buffer with free()
++MTMD_API size_t mtmd_video_frame_read_png(const struct mtmd_video_frame * frame,
++                                          unsigned char ** out_buf);
++
++#ifdef __cplusplus
++} // extern "C"
++#endif
++
++#endif // MTMD_HELPER_VIDEO_H
+diff --git a/tools/mtmd/mtmd-helper.cpp b/tools/mtmd/mtmd-helper.cpp
+index c75f90730..393ed06bb 100644
+--- a/tools/mtmd/mtmd-helper.cpp
++++ b/tools/mtmd/mtmd-helper.cpp
+@@ -174,6 +174,28 @@ struct decode_embd_batch {
+         }
+     }
+ 
++    // M-RoPE for video frame (3D: temporal + spatial)
++    // temporal_id: frame index in video (0-based) mapped to temporal position
++    // For Qwen2.5-VL: pos layout is [temporal, height, width, unused]
++    void set_position_mrope_3d(llama_pos pos_0, int nx, int ny, int temporal_id, llama_seq_id seq_id) {
++        GGML_ASSERT(n_pos_per_embd == 4);
++        seq_id_0[0] = seq_id;
++        for (int y = 0; y < ny; y++) {
++            for (int x = 0; x < nx; x++) {
++                int i = y * nx + x;
++                pos[i                     ] = pos_0 + temporal_id; // temporal dimension
++                pos[i + batch.n_tokens    ] = pos_0 + y;           // height
++                pos[i + batch.n_tokens * 2] = pos_0 + x;           // width
++                pos[i + batch.n_tokens * 3] = 0;                   // unused
++            }
++        }
++        for (int i = 0; i < batch.n_tokens; i++) {
++            batch.n_seq_id[i] = 1;
++            batch.seq_id  [i] = seq_id_0.data();
++            batch.logits  [i] = false;
++        }
++    }
++
+     // M-RoPE for audio
+     void set_position_mrope_1d(llama_pos pos_0, llama_seq_id seq_id) {
+         GGML_ASSERT(n_pos_per_embd == 4);
+@@ -260,7 +282,15 @@ int32_t mtmd_helper_decode_image_chunk(
+             }
+             const int nx = mtmd_image_tokens_get_nx(image_tokens);
+             const int ny = mtmd_image_tokens_get_ny(image_tokens);
+-            batch_embd.set_position_mrope_2d(n_past, nx, ny, seq_id);
++            const int n_frames = mtmd_image_tokens_get_n_frames_total(image_tokens);
++            const int frame_idx = mtmd_image_tokens_get_frame_idx(image_tokens);
++            if (n_frames > 0) {
++                // Video frame: use 3D positions (temporal + spatial)
++                batch_embd.set_position_mrope_3d(n_past, nx, ny, frame_idx, seq_id);
++            } else {
++                // Static image: use 2D positions (spatial only)
++                batch_embd.set_position_mrope_2d(n_past, nx, ny, seq_id);
++            }
+         } else if (chunk_type == MTMD_INPUT_CHUNK_TYPE_AUDIO) {
+             batch_embd.set_position_mrope_1d(n_past, seq_id);
+         } else {
+diff --git a/tools/mtmd/mtmd.cpp b/tools/mtmd/mtmd.cpp
+index 8ca979c86..9dd7320db 100644
+--- a/tools/mtmd/mtmd.cpp
++++ b/tools/mtmd/mtmd.cpp
+@@ -29,6 +29,11 @@ struct mtmd_bitmap {
+     std::vector<unsigned char> data;
+     std::string id; // optional user-defined id, for ex: can be set to image hash, useful for KV cache tracking
+     bool is_audio = false; // true if the bitmap is audio
++
++    // Video frame info (0 = static image)
++    int   frame_idx     = 0;
++    float timestamp_sec = 0.0f;
++    int   n_frames_total = 0; // total frames in the video this belongs to
+ };
+ 
+ struct mtmd_image_tokens {
+@@ -39,13 +44,21 @@ struct mtmd_image_tokens {
+     clip_image_f32_batch batch_f32; // preprocessed image patches
+     std::string id; // optional user-defined ID, useful for KV cache tracking
+ 
++    // Video temporal info
++    int   frame_idx      = 0;  // 0 = static image, 1+ = video frame index
++    float timestamp_sec   = 0.0f;
++    int   n_frames_total  = 0;  // total frames in the video (0 = not video)
++
+     mtmd_image_tokens clone() {
+         return mtmd_image_tokens{
+             nx,
+             ny,
+             use_mrope_pos,
+             batch_f32.clone(),
+-            id
++            id,
++            frame_idx,
++            timestamp_sec,
++            n_frames_total,
+         };
+     }
+ };
+@@ -658,6 +671,11 @@ struct mtmd_tokenizer {
+                 image_tokens->batch_f32 = std::move(batch_f32);
+                 image_tokens->id = bitmap->id; // optional
+ 
++                // Propagate video frame info from bitmap
++                image_tokens->frame_idx      = bitmap->frame_idx;
++                image_tokens->timestamp_sec  = bitmap->timestamp_sec;
++                image_tokens->n_frames_total = bitmap->n_frames_total;
++
+                 LOG_DBG("image_tokens->nx = %d\n", image_tokens->nx);
+                 LOG_DBG("image_tokens->ny = %d\n", image_tokens->ny);
+                 LOG_DBG("batch_f32 size = %d\n", (int)image_tokens->batch_f32.entries.size());
+@@ -978,6 +996,24 @@ void mtmd_bitmap_set_id(mtmd_bitmap * bitmap, const char * id) {
+     }
+ }
+ 
++void mtmd_bitmap_set_video_frame(mtmd_bitmap * bitmap, int frame_idx, int n_frames_total, float timestamp_sec) {
++    bitmap->frame_idx      = frame_idx;
++    bitmap->n_frames_total = n_frames_total;
++    bitmap->timestamp_sec  = timestamp_sec;
++}
++
++int mtmd_bitmap_get_frame_idx(const mtmd_bitmap * bitmap) {
++    return bitmap->frame_idx;
++}
++
++int mtmd_bitmap_get_n_frames_total(const mtmd_bitmap * bitmap) {
++    return bitmap->n_frames_total;
++}
++
++float mtmd_bitmap_get_timestamp_sec(const mtmd_bitmap * bitmap) {
++    return bitmap->timestamp_sec;
++}
++
+ void mtmd_bitmap_free(mtmd_bitmap * bitmap) {
+     if (bitmap) {
+         delete bitmap;
+@@ -1109,12 +1145,21 @@ const char * mtmd_image_tokens_get_id(const mtmd_image_tokens * image_tokens) {
+ llama_pos mtmd_image_tokens_get_n_pos(const mtmd_image_tokens * image_tokens) {
+     if (image_tokens->use_mrope_pos) {
+         // for M-RoPE, temporal dimension = max(t,h,w)
+-        // t is omitted as we don't support video input
+-        return std::max(image_tokens->nx, image_tokens->ny);
++        // for video: t = n_frames_total, for static image: t = 1
++        llama_pos t = (image_tokens->n_frames_total > 0) ? image_tokens->n_frames_total : 1;
++        return std::max({t, (llama_pos)image_tokens->nx, (llama_pos)image_tokens->ny});
+     }
+     return image_tokens->n_tokens();
+ }
+ 
++int mtmd_image_tokens_get_frame_idx(const mtmd_image_tokens * image_tokens) {
++    return image_tokens->frame_idx;
++}
++
++int mtmd_image_tokens_get_n_frames_total(const mtmd_image_tokens * image_tokens) {
++    return image_tokens->n_frames_total;
++}
++
+ // test function
+ 
+ mtmd_input_chunks * mtmd_test_create_input_chunks() {
+diff --git a/tools/mtmd/mtmd.h b/tools/mtmd/mtmd.h
+index ef25d32bb..a1a41a048 100644
+--- a/tools/mtmd/mtmd.h
++++ b/tools/mtmd/mtmd.h
+@@ -150,6 +150,12 @@ MTMD_API void                  mtmd_bitmap_free       (mtmd_bitmap * bitmap);
+ MTMD_API const char * mtmd_bitmap_get_id(const mtmd_bitmap * bitmap);
+ MTMD_API void         mtmd_bitmap_set_id(mtmd_bitmap * bitmap, const char * id);
+ 
++// video frame metadata - set these before mtmd_tokenize() for video frames
++MTMD_API void         mtmd_bitmap_set_video_frame(mtmd_bitmap * bitmap, int frame_idx, int n_frames_total, float timestamp_sec);
++MTMD_API int          mtmd_bitmap_get_frame_idx     (const mtmd_bitmap * bitmap);
++MTMD_API int          mtmd_bitmap_get_n_frames_total(const mtmd_bitmap * bitmap);
++MTMD_API float        mtmd_bitmap_get_timestamp_sec (const mtmd_bitmap * bitmap);
++
+ 
+ // mtmd_input_chunks
+ //
+@@ -190,6 +196,9 @@ MTMD_API size_t       mtmd_image_tokens_get_ny      (const mtmd_image_tokens * i
+ MTMD_API const char * mtmd_image_tokens_get_id      (const mtmd_image_tokens * image_tokens); // TODO: deprecate
+ // number of temporal positions (equals to max(t,h,w) for M-RoPE; equals to n_tokens otherwise)
+ MTMD_API llama_pos    mtmd_image_tokens_get_n_pos   (const mtmd_image_tokens * image_tokens); // TODO: deprecate
++// video frame info (frame_idx=0 means static image, >0 means video frame)
++MTMD_API int          mtmd_image_tokens_get_frame_idx     (const mtmd_image_tokens * image_tokens);
++MTMD_API int          mtmd_image_tokens_get_n_frames_total(const mtmd_image_tokens * image_tokens);
+ 
+ // tokenize an input text prompt and a list of bitmaps (images/audio)
+ // the prompt must have the input image marker (default: "<__media__>") in it
+diff --git a/tools/server/server-common.cpp b/tools/server/server-common.cpp
+index 5b8895b34..8ed13c030 100644
+--- a/tools/server/server-common.cpp
++++ b/tools/server/server-common.cpp
+@@ -4,6 +4,7 @@
+ #include "llama.h"
+ #include "mtmd.h"
+ #include "mtmd-helper.h"
++#include "mtmd-helper-video.h"
+ #include "chat.h"
+ #include "base64.hpp"
+ 
+@@ -691,9 +692,11 @@ static std::string fnv_hash(const uint8_t * data, size_t len) {
+     return std::to_string(hash);
+ }
+ 
+-server_tokens process_mtmd_prompt(mtmd_context * mctx, std::string prompt, std::vector<raw_buffer> files) {
++server_tokens process_mtmd_prompt(mtmd_context * mctx, std::string prompt, std::vector<raw_buffer> files,
++                                  const std::vector<video_frame_meta> & video_frames) {
+     mtmd::bitmaps bitmaps;
+-    for (auto & file : files) {
++    for (size_t i = 0; i < files.size(); i++) {
++        auto & file = files[i];
+         mtmd::bitmap bmp(mtmd_helper_bitmap_init_from_buf(mctx, file.data(), file.size()));
+         if (!bmp.ptr) {
+             throw std::runtime_error("Failed to load image or audio file");
+@@ -701,6 +704,15 @@ server_tokens process_mtmd_prompt(mtmd_context * mctx, std::string prompt, std::
+         // calculate bitmap hash (for KV caching)
+         std::string hash = fnv_hash(bmp.data(), bmp.n_bytes());
+         bmp.set_id(hash.c_str());
++
++        // Apply video frame metadata if this file index is tagged as a video frame
++        for (const auto & vf : video_frames) {
++            if (vf.file_idx == (int)i) {
++                mtmd_bitmap_set_video_frame(bmp.ptr.get(), vf.frame_idx, vf.n_frames_total, vf.timestamp_sec);
++                break;
++            }
++        }
++
+         bitmaps.entries.push_back(std::move(bmp));
+     }
+     // process prompt
+@@ -889,7 +901,8 @@ static void handle_media(
+ json oaicompat_chat_params_parse(
+     json & body, /* openai api json semantics */
+     const server_chat_params & opt,
+-    std::vector<raw_buffer> & out_files)
++    std::vector<raw_buffer> & out_files,
++    std::vector<video_frame_meta> & out_video_frames)
+ {
+     json llama_params;
+ 
+@@ -999,6 +1012,97 @@ json oaicompat_chat_params_parse(
+                 p["text"] = mtmd_default_marker();
+                 p.erase("input_audio");
+ 
++            } else if (type == "video_url") {
++                if (!opt.allow_image) {
++                    throw std::runtime_error("video input is not supported - hint: vision model with mmproj is required for video");
++                }
++
++                json video_url_obj = json_value(p, "video_url", json::object());
++                std::string url = json_value(video_url_obj, "url", std::string());
++                int max_frames = json_value(video_url_obj, "max_frames", 15);
++                float scene_threshold = json_value(video_url_obj, "scene_threshold", 0.3f);
++
++                // Resolve URL to local path
++                std::string local_path;
++                if (string_starts_with(url, "file://")) {
++                    if (opt.media_path.empty()) {
++                        throw std::invalid_argument("file:// URLs are not allowed unless --media-path is specified");
++                    }
++                    std::string file_path = url.substr(7);
++                    if (!fs_validate_filename(file_path, true)) {
++                        throw std::invalid_argument("file path is not allowed: " + file_path);
++                    }
++                    local_path = opt.media_path + file_path;
++                } else if (string_starts_with(url, "http")) {
++                    // Download to temp file
++                    common_remote_params params;
++                    params.max_size = 1024 * 1024 * 200; // 200MB for video
++                    params.timeout  = 120; // 2 min for video download
++                    SRV_INF("downloading video from '%s'\n", url.c_str());
++                    auto res = common_remote_get_content(url, params);
++                    if (200 <= res.first && res.first < 300) {
++                        // Write to temp file for ffmpeg processing
++                        std::string tmp_path = url.substr(url.rfind('/') + 1);
++                        if (tmp_path.empty() || tmp_path.size() > 200) tmp_path = "video_tmp.mp4";
++                        const char * tmp_env = std::getenv("TEMP");
++                        if (!tmp_env) tmp_env = std::getenv("TMP");
++                        if (!tmp_env) tmp_env = "/tmp";
++                        local_path = std::string(tmp_env) + "/" + tmp_path;
++                        std::ofstream tmp_file(local_path, std::ios::binary);
++                        tmp_file.write(reinterpret_cast<const char *>(res.second.data()), res.second.size());
++                        tmp_file.close();
++                        SRV_INF("video saved to temp: %s (%zu bytes)\n", local_path.c_str(), res.second.size());
++                    } else {
++                        throw std::runtime_error("Failed to download video from: " + url);
++                    }
++                } else {
++                    // Assume local path directly
++                    local_path = url;
++                }
++
++                // Extract video frames
++                auto * video = mtmd_video_load(local_path.c_str(), max_frames, scene_threshold);
++                if (!video) {
++                    throw std::runtime_error("Failed to extract frames from video: " + local_path);
++                }
++
++                SRV_INF("extracted %d frames from video (duration=%.1fs)\n", video->n_frames, video->duration_sec);
++
++                // Load each frame PNG into out_files as raw buffers and record video frame metadata
++                int n_total = video->n_frames;
++                for (int fi = 0; fi < video->n_frames; fi++) {
++                    unsigned char * png_buf = nullptr;
++                    size_t png_size = mtmd_video_frame_read_png(&video->frames[fi], &png_buf);
++                    if (png_size == 0 || !png_buf) {
++                        SRV_ERR("failed to read frame %d PNG\n", fi);
++                        mtmd_video_free(video);
++                        throw std::runtime_error("Failed to read video frame PNG");
++                    }
++                    raw_buffer frame_data(png_buf, png_buf + png_size);
++                    free(png_buf);
++
++                    video_frame_meta vfm;
++                    vfm.file_idx       = (int)out_files.size(); // index into out_files
++                    vfm.frame_idx      = fi;
++                    vfm.n_frames_total = n_total;
++                    vfm.timestamp_sec  = video->frames[fi].timestamp_sec;
++                    out_video_frames.push_back(vfm);
++
++                    out_files.push_back(std::move(frame_data));
++                }
++
++                // Replace with media markers (one per frame)
++                std::string markers;
++                for (int fi = 0; fi < video->n_frames; fi++) {
++                    markers += mtmd_default_marker();
++                }
++
++                p["type"] = "media_marker";
++                p["text"] = markers;
++                p.erase("video_url");
++
++                mtmd_video_free(video);
++
+             } else if (type != "text") {
+                 throw std::invalid_argument("unsupported content[].type");
+             }
+diff --git a/tools/server/server-common.h b/tools/server/server-common.h
+index a234541e1..6fa5ab7dc 100644
+--- a/tools/server/server-common.h
++++ b/tools/server/server-common.h
+@@ -250,8 +250,18 @@ llama_tokens tokenize_mixed(const llama_vocab * vocab, const json & json_prompt,
+ // if validate_utf8(text) == text.size(), then the whole text is valid utf8
+ size_t validate_utf8(const std::string& text);
+ 
++// Video frame metadata for propagating temporal info to bitmap processing
++struct video_frame_meta {
++    int   file_idx;       // index into the out_files vector
++    int   frame_idx;      // 0-based frame index within the video
++    int   n_frames_total; // total frames in the video
++    float timestamp_sec;
++};
++
+ // process mtmd prompt, return the server_tokens containing both text tokens and media chunks
+-server_tokens process_mtmd_prompt(mtmd_context * mctx, std::string prompt, std::vector<raw_buffer> files);
++// video_frames is optional - when set, it tags specific file entries as video frames
++server_tokens process_mtmd_prompt(mtmd_context * mctx, std::string prompt, std::vector<raw_buffer> files,
++                                  const std::vector<video_frame_meta> & video_frames = {});
+ 
+ /**
+  * break the input "prompt" object into multiple prompt if needed, then tokenize them
+@@ -297,7 +307,8 @@ json oaicompat_completion_params_parse(const json & body);
+ json oaicompat_chat_params_parse(
+     json & body, /* openai api json semantics */
+     const server_chat_params & opt,
+-    std::vector<raw_buffer> & out_files);
++    std::vector<raw_buffer> & out_files,
++    std::vector<video_frame_meta> & out_video_frames);
+ 
+ // convert OpenAI Responses API format to OpenAI Chat Completions API format
+ json convert_responses_to_chatcmpl(const json & body);
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index b86e7e608..29c2a4a6c 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -3029,7 +3029,8 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
+             server_task_type type,
+             const json & data,
+             const std::vector<raw_buffer> & files,
+-            task_response_type res_type) {
++            task_response_type res_type,
++            const std::vector<video_frame_meta> & video_frames) {
+     GGML_ASSERT(type == SERVER_TASK_TYPE_COMPLETION || type == SERVER_TASK_TYPE_INFILL);
+ 
+     auto res = create_response();
+@@ -3048,7 +3049,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
+ 
+         if (res_type != TASK_RESPONSE_TYPE_NONE && ctx_server.mctx != nullptr) {
+             // This is the case used by OAI compatible chat path with MTMD. TODO It can be moved to the path below.
+-            inputs.push_back(process_mtmd_prompt(ctx_server.mctx, prompt.get<std::string>(), files));
++            inputs.push_back(process_mtmd_prompt(ctx_server.mctx, prompt.get<std::string>(), files, video_frames));
+         } else {
+             // Everything else, including multimodal completions.
+             inputs = tokenize_input_prompts(ctx_server.vocab, ctx_server.mctx, prompt, true, true);
+@@ -3647,65 +3648,76 @@ void server_routes::init_routes() {
+     this->post_chat_completions = [this](const server_http_req & req) {
+         auto res = create_response();
+         std::vector<raw_buffer> files;
++        std::vector<video_frame_meta> video_frames;
+         json body = json::parse(req.body);
+         json body_parsed = oaicompat_chat_params_parse(
+             body,
+             meta->chat_params,
+-            files);
++            files,
++            video_frames);
+         return handle_completions_impl(
+             req,
+             SERVER_TASK_TYPE_COMPLETION,
+             body_parsed,
+             files,
+-            TASK_RESPONSE_TYPE_OAI_CHAT);
++            TASK_RESPONSE_TYPE_OAI_CHAT,
++            video_frames);
+     };
+ 
+     this->post_responses_oai = [this](const server_http_req & req) {
+         auto res = create_response();
+         std::vector<raw_buffer> files;
++        std::vector<video_frame_meta> video_frames;
+         json body = convert_responses_to_chatcmpl(json::parse(req.body));
+         SRV_DBG("%s\n", "Request converted: OpenAI Responses -> OpenAI Chat Completions");
+         SRV_DBG("converted request: %s\n", body.dump().c_str());
+         json body_parsed = oaicompat_chat_params_parse(
+             body,
+             meta->chat_params,
+-            files);
++            files,
++            video_frames);
+         return handle_completions_impl(
+             req,
+             SERVER_TASK_TYPE_COMPLETION,
+             body_parsed,
+             files,
+-            TASK_RESPONSE_TYPE_OAI_RESP);
++            TASK_RESPONSE_TYPE_OAI_RESP,
++            video_frames);
+     };
+ 
+     this->post_anthropic_messages = [this](const server_http_req & req) {
+         auto res = create_response();
+         std::vector<raw_buffer> files;
++        std::vector<video_frame_meta> video_frames;
+         json body = convert_anthropic_to_oai(json::parse(req.body));
+         SRV_DBG("%s\n", "Request converted: Anthropic -> OpenAI Chat Completions");
+         SRV_DBG("converted request: %s\n", body.dump().c_str());
+         json body_parsed = oaicompat_chat_params_parse(
+             body,
+             meta->chat_params,
+-            files);
++            files,
++            video_frames);
+         return handle_completions_impl(
+             req,
+             SERVER_TASK_TYPE_COMPLETION,
+             body_parsed,
+             files,
+-            TASK_RESPONSE_TYPE_ANTHROPIC);
++            TASK_RESPONSE_TYPE_ANTHROPIC,
++            video_frames);
+     };
+ 
+     this->post_anthropic_count_tokens = [this](const server_http_req & req) {
+         auto res = create_response();
+         std::vector<raw_buffer> files;
++        std::vector<video_frame_meta> video_frames;
+         json body = convert_anthropic_to_oai(json::parse(req.body));
+         SRV_DBG("%s\n", "Request converted: Anthropic -> OpenAI Chat Completions");
+         SRV_DBG("converted request: %s\n", body.dump().c_str());
+         json body_parsed = oaicompat_chat_params_parse(
+             body,
+             meta->chat_params,
+-            files);
++            files,
++            video_frames);
+ 
+         json prompt = body_parsed.at("prompt");
+         llama_tokens tokens = tokenize_mixed(ctx_server.vocab, prompt, true, true);
+@@ -3717,11 +3729,13 @@ void server_routes::init_routes() {
+     this->post_apply_template = [this](const server_http_req & req) {
+         auto res = create_response();
+         std::vector<raw_buffer> files; // dummy, unused
++        std::vector<video_frame_meta> video_frames; // dummy, unused
+         json body = json::parse(req.body);
+         json data = oaicompat_chat_params_parse(
+             body,
+             meta->chat_params,
+-            files);
++            files,
++            video_frames);
+         res->ok({{ "prompt", std::move(data.at("prompt")) }});
+         return res;
+     };
+diff --git a/tools/server/server-context.h b/tools/server/server-context.h
+index 75f3d2de5..63d0af000 100644
+--- a/tools/server/server-context.h
++++ b/tools/server/server-context.h
+@@ -121,7 +121,8 @@ private:
+             server_task_type type,
+             const json & data,
+             const std::vector<raw_buffer> & files,
+-            task_response_type res_type);
++            task_response_type res_type,
++            const std::vector<video_frame_meta> & video_frames = {});
+     std::unique_ptr<server_res_generator> handle_slots_save(const server_http_req & req, int id_slot);
+     std::unique_ptr<server_res_generator> handle_slots_restore(const server_http_req & req, int id_slot);
+     std::unique_ptr<server_res_generator> handle_slots_erase(const server_http_req &, int id_slot);

@@ -12,6 +12,8 @@
 #include <string>
 #include <vector>
 #include <cinttypes>
+#include <mutex>
+#include <unordered_map>
 
 using json = nlohmann::ordered_json;
 
@@ -257,6 +259,41 @@ struct video_frame_meta {
     int   n_frames_total; // total frames in the video
     float timestamp_sec;
 };
+
+// Upload store — manages temp files uploaded via /v1/upload/video
+// Thread-safe. Files are auto-deleted after TTL expiration.
+struct video_upload_entry {
+    std::string id;            // unique upload ID
+    std::string tmp_path;      // path to temp file on disk
+    std::string filename;      // original filename
+    std::string content_type;  // MIME type
+    size_t      size = 0;      // file size in bytes
+    int64_t     created_at = 0; // unix timestamp
+};
+
+class video_upload_store {
+public:
+    // Store a new upload, returns the assigned upload ID
+    std::string add(const std::string & tmp_path, const std::string & filename,
+                    const std::string & content_type, size_t size);
+
+    // Resolve an upload ID to its temp file path (empty if not found or expired)
+    std::string resolve(const std::string & id) const;
+
+    // Remove an upload (and delete the temp file)
+    void remove(const std::string & id);
+
+    // Remove uploads older than ttl_seconds
+    void cleanup(int ttl_seconds = 3600);
+
+private:
+    mutable std::mutex mtx;
+    std::unordered_map<std::string, video_upload_entry> entries;
+};
+
+// Global upload store (owned by server main, passed around via reference)
+// Declared extern — defined in server-common.cpp
+extern video_upload_store g_video_uploads;
 
 // process mtmd prompt, return the server_tokens containing both text tokens and media chunks
 // video_frames is optional - when set, it tags specific file entries as video frames

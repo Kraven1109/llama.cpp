@@ -121,6 +121,22 @@
 					{/if}
 				</button>
 
+				<!-- Video -->
+				<button
+					type="button"
+					class={sheetItemClass}
+					disabled={!hasVisionModality}
+					onclick={handleSheetFileUpload}
+				>
+					<FILE_TYPE_ICONS.video class="h-4 w-4 shrink-0" />
+
+					<span>Video Files</span>
+
+					{#if !hasVisionModality}
+						<span class="ml-auto text-xs text-muted-foreground">Requires vision model</span>
+					{/if}
+				</button>
+
 				<button type="button" class={sheetItemClass} onclick={handleSheetFileUpload}>
 					<FILE_TYPE_ICONS.text class="h-4 w-4 shrink-0" />
 
