@@ -4,6 +4,7 @@
 #include "llama.h"
 #include "mtmd.h"
 #include "mtmd-helper.h"
+#include "mtmd-helper-video.h"
 #include "chat.h"
 #include "base64.hpp"
 
@@ -691,9 +692,11 @@ static std::string fnv_hash(const uint8_t * data, size_t len) {
     return std::to_string(hash);
 }
 
-server_tokens process_mtmd_prompt(mtmd_context * mctx, std::string prompt, std::vector<raw_buffer> files) {
+server_tokens process_mtmd_prompt(mtmd_context * mctx, std::string prompt, std::vector<raw_buffer> files,
+                                  const std::vector<video_frame_meta> & video_frames) {
     mtmd::bitmaps bitmaps;
-    for (auto & file : files) {
+    for (size_t i = 0; i < files.size(); i++) {
+        auto & file = files[i];
         mtmd::bitmap bmp(mtmd_helper_bitmap_init_from_buf(mctx, file.data(), file.size()));
         if (!bmp.ptr) {
             throw std::runtime_error("Failed to load image or audio file");
@@ -701,6 +704,15 @@ server_tokens process_mtmd_prompt(mtmd_context * mctx, std::string prompt, std::
         // calculate bitmap hash (for KV caching)
         std::string hash = fnv_hash(bmp.data(), bmp.n_bytes());
         bmp.set_id(hash.c_str());
+
+        // Apply video frame metadata if this file index is tagged as a video frame
+        for (const auto & vf : video_frames) {
+            if (vf.file_idx == (int)i) {
+                mtmd_bitmap_set_video_frame(bmp.ptr.get(), vf.frame_idx, vf.n_frames_total, vf.timestamp_sec);
+                break;
+            }
+        }
+
         bitmaps.entries.push_back(std::move(bmp));
     }
     // process prompt
@@ -889,7 +901,8 @@ static void handle_media(
 json oaicompat_chat_params_parse(
     json & body, /* openai api json semantics */
     const server_chat_params & opt,
-    std::vector<raw_buffer> & out_files)
+    std::vector<raw_buffer> & out_files,
+    std::vector<video_frame_meta> & out_video_frames)
 {
     json llama_params;
 
@@ -998,6 +1011,97 @@ json oaicompat_chat_params_parse(
                 p["type"] = "media_marker";
                 p["text"] = mtmd_default_marker();
                 p.erase("input_audio");
+
+            } else if (type == "video_url") {
+                if (!opt.allow_image) {
+                    throw std::runtime_error("video input is not supported - hint: vision model with mmproj is required for video");
+                }
+
+                json video_url_obj = json_value(p, "video_url", json::object());
+                std::string url = json_value(video_url_obj, "url", std::string());
+                int max_frames = json_value(video_url_obj, "max_frames", 15);
+                float scene_threshold = json_value(video_url_obj, "scene_threshold", 0.3f);
+
+                // Resolve URL to local path
+                std::string local_path;
+                if (string_starts_with(url, "file://")) {
+                    if (opt.media_path.empty()) {
+                        throw std::invalid_argument("file:// URLs are not allowed unless --media-path is specified");
+                    }
+                    std::string file_path = url.substr(7);
+                    if (!fs_validate_filename(file_path, true)) {
+                        throw std::invalid_argument("file path is not allowed: " + file_path);
+                    }
+                    local_path = opt.media_path + file_path;
+                } else if (string_starts_with(url, "http")) {
+                    // Download to temp file
+                    common_remote_params params;
+                    params.max_size = 1024 * 1024 * 200; // 200MB for video
+                    params.timeout  = 120; // 2 min for video download
+                    SRV_INF("downloading video from '%s'\n", url.c_str());
+                    auto res = common_remote_get_content(url, params);
+                    if (200 <= res.first && res.first < 300) {
+                        // Write to temp file for ffmpeg processing
+                        std::string tmp_path = url.substr(url.rfind('/') + 1);
+                        if (tmp_path.empty() || tmp_path.size() > 200) tmp_path = "video_tmp.mp4";
+                        const char * tmp_env = std::getenv("TEMP");
+                        if (!tmp_env) tmp_env = std::getenv("TMP");
+                        if (!tmp_env) tmp_env = "/tmp";
+                        local_path = std::string(tmp_env) + "/" + tmp_path;
+                        std::ofstream tmp_file(local_path, std::ios::binary);
+                        tmp_file.write(reinterpret_cast<const char *>(res.second.data()), res.second.size());
+                        tmp_file.close();
+                        SRV_INF("video saved to temp: %s (%zu bytes)\n", local_path.c_str(), res.second.size());
+                    } else {
+                        throw std::runtime_error("Failed to download video from: " + url);
+                    }
+                } else {
+                    // Assume local path directly
+                    local_path = url;
+                }
+
+                // Extract video frames
+                auto * video = mtmd_video_load(local_path.c_str(), max_frames, scene_threshold);
+                if (!video) {
+                    throw std::runtime_error("Failed to extract frames from video: " + local_path);
+                }
+
+                SRV_INF("extracted %d frames from video (duration=%.1fs)\n", video->n_frames, video->duration_sec);
+
+                // Load each frame PNG into out_files as raw buffers and record video frame metadata
+                int n_total = video->n_frames;
+                for (int fi = 0; fi < video->n_frames; fi++) {
+                    unsigned char * png_buf = nullptr;
+                    size_t png_size = mtmd_video_frame_read_png(&video->frames[fi], &png_buf);
+                    if (png_size == 0 || !png_buf) {
+                        SRV_ERR("failed to read frame %d PNG\n", fi);
+                        mtmd_video_free(video);
+                        throw std::runtime_error("Failed to read video frame PNG");
+                    }
+                    raw_buffer frame_data(png_buf, png_buf + png_size);
+                    free(png_buf);
+
+                    video_frame_meta vfm;
+                    vfm.file_idx       = (int)out_files.size(); // index into out_files
+                    vfm.frame_idx      = fi;
+                    vfm.n_frames_total = n_total;
+                    vfm.timestamp_sec  = video->frames[fi].timestamp_sec;
+                    out_video_frames.push_back(vfm);
+
+                    out_files.push_back(std::move(frame_data));
+                }
+
+                // Replace with media markers (one per frame)
+                std::string markers;
+                for (int fi = 0; fi < video->n_frames; fi++) {
+                    markers += mtmd_default_marker();
+                }
+
+                p["type"] = "media_marker";
+                p["text"] = markers;
+                p.erase("video_url");
+
+                mtmd_video_free(video);
 
             } else if (type != "text") {
                 throw std::invalid_argument("unsupported content[].type");

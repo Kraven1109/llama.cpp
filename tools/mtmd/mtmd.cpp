@@ -31,6 +31,11 @@ struct mtmd_bitmap {
     std::vector<unsigned char> data;
     std::string id; // optional user-defined id, for ex: can be set to image hash, useful for KV cache tracking
     bool is_audio = false; // true if the bitmap is audio
+
+    // Video frame info (0 = static image)
+    int   frame_idx     = 0;
+    float timestamp_sec = 0.0f;
+    int   n_frames_total = 0; // total frames in the video this belongs to
 };
 
 struct mtmd_image_tokens {
@@ -41,13 +46,21 @@ struct mtmd_image_tokens {
     clip_image_f32_batch batch_f32; // preprocessed image patches
     std::string id; // optional user-defined ID, useful for KV cache tracking
 
+    // Video temporal info
+    int   frame_idx      = 0;  // 0 = static image, 1+ = video frame index
+    float timestamp_sec   = 0.0f;
+    int   n_frames_total  = 0;  // total frames in the video (0 = not video)
+
     mtmd_image_tokens clone() {
         return mtmd_image_tokens{
             nx,
             ny,
             use_mrope_pos,
             batch_f32.clone(),
-            id
+            id,
+            frame_idx,
+            timestamp_sec,
+            n_frames_total,
         };
     }
 };
@@ -750,6 +763,11 @@ struct mtmd_tokenizer {
                 image_tokens->batch_f32 = std::move(batch_f32);
                 image_tokens->id = bitmap->id; // optional
 
+                // Propagate video frame info from bitmap
+                image_tokens->frame_idx      = bitmap->frame_idx;
+                image_tokens->timestamp_sec  = bitmap->timestamp_sec;
+                image_tokens->n_frames_total = bitmap->n_frames_total;
+
                 LOG_DBG("image_tokens->nx = %d\n", image_tokens->nx);
                 LOG_DBG("image_tokens->ny = %d\n", image_tokens->ny);
                 LOG_DBG("batch_f32 size = %d\n", (int)image_tokens->batch_f32.entries.size());
@@ -1078,6 +1096,24 @@ void mtmd_bitmap_set_id(mtmd_bitmap * bitmap, const char * id) {
     }
 }
 
+void mtmd_bitmap_set_video_frame(mtmd_bitmap * bitmap, int frame_idx, int n_frames_total, float timestamp_sec) {
+    bitmap->frame_idx      = frame_idx;
+    bitmap->n_frames_total = n_frames_total;
+    bitmap->timestamp_sec  = timestamp_sec;
+}
+
+int mtmd_bitmap_get_frame_idx(const mtmd_bitmap * bitmap) {
+    return bitmap->frame_idx;
+}
+
+int mtmd_bitmap_get_n_frames_total(const mtmd_bitmap * bitmap) {
+    return bitmap->n_frames_total;
+}
+
+float mtmd_bitmap_get_timestamp_sec(const mtmd_bitmap * bitmap) {
+    return bitmap->timestamp_sec;
+}
+
 void mtmd_bitmap_free(mtmd_bitmap * bitmap) {
     if (bitmap) {
         delete bitmap;
@@ -1209,10 +1245,19 @@ const char * mtmd_image_tokens_get_id(const mtmd_image_tokens * image_tokens) {
 llama_pos mtmd_image_tokens_get_n_pos(const mtmd_image_tokens * image_tokens) {
     if (image_tokens->use_mrope_pos) {
         // for M-RoPE, temporal dimension = max(t,h,w)
-        // t is omitted as we don't support video input
-        return std::max(image_tokens->nx, image_tokens->ny);
+        // for video: t = n_frames_total, for static image: t = 1
+        llama_pos t = (image_tokens->n_frames_total > 0) ? image_tokens->n_frames_total : 1;
+        return std::max({t, (llama_pos)image_tokens->nx, (llama_pos)image_tokens->ny});
     }
     return image_tokens->n_tokens();
+}
+
+int mtmd_image_tokens_get_frame_idx(const mtmd_image_tokens * image_tokens) {
+    return image_tokens->frame_idx;
+}
+
+int mtmd_image_tokens_get_n_frames_total(const mtmd_image_tokens * image_tokens) {
+    return image_tokens->n_frames_total;
 }
 
 // test function

@@ -324,6 +324,10 @@ struct clip_image_u8 {
     int nx;
     int ny;
 
+    // Video temporal info (0 = static image, >0 = video frame index)
+    int   frame_idx     = 0;
+    float timestamp_sec = 0.0f;
+
     std::vector<uint8_t> buf;
 };
 
