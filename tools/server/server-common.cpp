@@ -14,6 +14,7 @@
 #include <sstream>
 #include <fstream>
 #include <filesystem>
+#include <atomic>
 
 json format_error_response(const std::string & message, const enum error_type type) {
     std::string type_str;
@@ -1079,6 +1080,7 @@ json oaicompat_chat_params_parse(
 
                 // Resolve URL to local path
                 std::string local_path;
+                bool local_path_is_temp = false; // true when we created this file and must delete it after use
                 if (string_starts_with(url, "file://")) {
                     if (opt.media_path.empty()) {
                         throw std::invalid_argument("file:// URLs are not allowed unless --media-path is specified");
@@ -1117,10 +1119,15 @@ json oaicompat_chat_params_parse(
                     }
 
                     // Write to temp file using filesystem path (avoids mixed-separator issues on Windows)
+                    // Use unique counter to avoid race conditions on concurrent requests
                     {
+                        static std::atomic<uint64_t> data_url_counter{0};
+                        auto uid = data_url_counter.fetch_add(1);
                         std::filesystem::path tmp_fspath =
-                            std::filesystem::temp_directory_path() / ("llama_video_upload" + ext);
+                            std::filesystem::temp_directory_path() /
+                            ("llama_video_upload_" + std::to_string(uid) + ext);
                         local_path = tmp_fspath.u8string();
+                        local_path_is_temp = true;
                         std::ofstream tmp_file(tmp_fspath, std::ios::binary);
                         if (!tmp_file.is_open()) {
                             throw std::runtime_error("Failed to create temp video file: " + local_path);
@@ -1128,6 +1135,7 @@ json oaicompat_chat_params_parse(
                         tmp_file.write(reinterpret_cast<const char *>(decoded.data()), decoded.size());
                         if (!tmp_file.good()) {
                             tmp_file.close();
+                            std::error_code ec; std::filesystem::remove(tmp_fspath, ec);
                             throw std::runtime_error("Failed to write video data to: " + local_path);
                         }
                         tmp_file.close();
@@ -1150,14 +1158,21 @@ json oaicompat_chat_params_parse(
                     auto res = common_remote_get_content(url, params);
                     if (200 <= res.first && res.first < 300) {
                         // Write to temp file for ffmpeg processing
-                        std::string tmp_path = url.substr(url.rfind('/') + 1);
-                        if (tmp_path.empty() || tmp_path.size() > 200) tmp_path = "video_tmp.mp4";
-                        const char * tmp_env = std::getenv("TEMP");
-                        if (!tmp_env) tmp_env = std::getenv("TMP");
-                        if (!tmp_env) tmp_env = "/tmp";
-                        local_path = std::string(tmp_env) + "/" + tmp_path;
-                        std::ofstream tmp_file(local_path, std::ios::binary);
+                        // Use unique counter + std::filesystem for cross-platform temp dir (fixes Linux /tmp issue)
+                        static std::atomic<uint64_t> http_dl_counter{0};
+                        auto uid = http_dl_counter.fetch_add(1);
+                        std::string tmp_filename = "llama_video_dl_" + std::to_string(uid) + ".mp4";
+                        std::filesystem::path tmp_fspath =
+                            std::filesystem::temp_directory_path() / tmp_filename;
+                        local_path = tmp_fspath.u8string();
+                        local_path_is_temp = true;
+                        std::ofstream tmp_file(tmp_fspath, std::ios::binary);
                         tmp_file.write(reinterpret_cast<const char *>(res.second.data()), res.second.size());
+                        if (!tmp_file.good()) {
+                            tmp_file.close();
+                            std::error_code ec; std::filesystem::remove(tmp_fspath, ec);
+                            throw std::runtime_error("Failed to write downloaded video to: " + local_path);
+                        }
                         tmp_file.close();
                         SRV_INF("video saved to temp: %s (%zu bytes)\n", local_path.c_str(), res.second.size());
                     } else {
@@ -1171,6 +1186,10 @@ json oaicompat_chat_params_parse(
                 // Extract video frames
                 auto * video = mtmd_video_load(local_path.c_str(), max_frames, fps, scene_threshold);
                 if (!video) {
+                    if (local_path_is_temp) {
+                        std::error_code ec;
+                        std::filesystem::remove(local_path, ec);
+                    }
                     throw std::runtime_error("Failed to extract frames from video: " + local_path);
                 }
 
@@ -1185,6 +1204,10 @@ json oaicompat_chat_params_parse(
                     if (png_size == 0 || !png_buf) {
                         SRV_ERR("failed to read frame %d PNG\n", fi);
                         mtmd_video_free(video);
+                        if (local_path_is_temp) {
+                            std::error_code ec;
+                            std::filesystem::remove(local_path, ec);
+                        }
                         throw std::runtime_error("Failed to read video frame PNG");
                     }
                     raw_buffer frame_data(png_buf, png_buf + png_size);
@@ -1211,6 +1234,12 @@ json oaicompat_chat_params_parse(
                 p.erase("video_url");
 
                 mtmd_video_free(video);
+
+                // Clean up the temp input video file (data URL or HTTP download paths)
+                if (local_path_is_temp) {
+                    std::error_code ec;
+                    std::filesystem::remove(local_path, ec);
+                }
 
             } else if (type != "text") {
                 throw std::invalid_argument("unsupported content[].type");

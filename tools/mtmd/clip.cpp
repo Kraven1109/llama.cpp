@@ -3575,7 +3575,6 @@ bool clip_image_preprocess(struct clip_ctx * ctx, const clip_image_u8 * img, str
     return true;
 }
 
->>>>>>> e04bd9273 (mtmd : add Step3-VL (Step1.5V) multimodal support)
 ggml_tensor * clip_get_newline_tensor(const struct clip_ctx * ctx) {
     return ctx->model.image_newline;
 }
