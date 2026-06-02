@@ -1,6 +1,7 @@
 #include "server-chat.h"
 #include "server-common.h"
 
+#include <fstream>
 #include <sstream>
 
 json server_chat_convert_responses_to_chatcmpl(const json & response_body) {
@@ -580,14 +581,25 @@ json server_chat_msg_diff_to_json_oaicompat(const common_chat_msg_diff & diff) {
 json convert_transcriptions_to_chatcmpl(
         const json & inp_body,
         const common_chat_templates * tmpls,
-        const std::map<std::string, uploaded_file> & in_files,
+        const std::map<std::string, server_http_context::uploaded_file> & in_files,
         std::vector<raw_buffer> & out_files) {
     // TODO @ngxson : this function may need to be improved in the future
     // handle input files
     out_files.clear();
     auto it = in_files.find("file");
     if (it != in_files.end()) {
-        out_files.push_back(it->second.data);
+        const auto & file = it->second;
+        std::ifstream tmp_file(file.tmp_path, std::ios::binary | std::ios::ate);
+        if (!tmp_file) {
+            throw std::invalid_argument("Failed to open audio file");
+        }
+        std::streamsize size = tmp_file.tellg();
+        tmp_file.seekg(0, std::ios::beg);
+        raw_buffer data(size);
+        if (!tmp_file.read(reinterpret_cast<char*>(data.data()), size)) {
+            throw std::invalid_argument("Failed to read audio file");
+        }
+        out_files.push_back(std::move(data));
     } else {
         throw std::invalid_argument("No input file found for transcription");
     }

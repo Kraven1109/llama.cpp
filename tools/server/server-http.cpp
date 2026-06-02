@@ -10,6 +10,8 @@
 #include <memory>
 #include <string>
 #include <thread>
+#include <filesystem>
+#include <atomic>
 
 //
 // HTTP implementation using cpp-httplib
@@ -478,7 +480,6 @@ void server_http_context::get(const std::string & path, const server_http_contex
             req.path,
             build_query_string(req),
             req.body,
-            {},
             req.is_connection_closed
         });
         server_http_res_ptr response = handler(*request);
@@ -490,7 +491,6 @@ void server_http_context::post(const std::string & path, const server_http_conte
     handlers.emplace(path, handler);
     pimpl->srv->Post(path_prefix + path, [handler](const httplib::Request & req, httplib::Response & res) {
         std::string body = req.body;
-        std::map<std::string, uploaded_file> files;
 
         if (req.is_multipart_form_data()) {
             // translate text fields to a JSON object and use it as the body
@@ -508,15 +508,6 @@ void server_http_context::post(const std::string & path, const server_http_conte
                 }
             }
             body = form_json.dump();
-
-            // populate files from multipart form
-            for (const auto & [key, file] : req.form.files) {
-                files[key] = uploaded_file{
-                    raw_buffer(file.content.begin(), file.content.end()),
-                    file.filename,
-                    file.content_type,
-                };
-            }
         }
 
         server_http_req_ptr request = std::make_unique<server_http_req>(server_http_req{
@@ -525,13 +516,134 @@ void server_http_context::post(const std::string & path, const server_http_conte
             req.path,
             build_query_string(req),
             body,
-            std::move(files),
             req.is_connection_closed
         });
         server_http_res_ptr response = handler(*request);
         process_handler_response(std::move(request), response, res);
     });
 }
+
+void server_http_context::post_multipart(
+    const std::string & path,
+    const server_http_context::multipart_handler_t & handler,
+    size_t max_file_size) const
+{
+    if (max_file_size == 0) {
+        max_file_size = (size_t)2 * 1024 * 1024 * 1024; // 2GB
+    }
+
+    pimpl->srv->Post(path_prefix + path,
+        [handler, max_file_size](const httplib::Request & req, httplib::Response & res,
+                                 const httplib::ContentReader & content_reader) {
+            server_http_context::multipart_req mreq;
+            mreq.params  = get_params(req);
+            mreq.headers = get_headers(req);
+            mreq.path    = req.path;
+            mreq.query_string = build_query_string(req);
+            mreq.is_closed    = req.is_connection_closed;
+
+            // State for streaming multipart parts
+            FILE * cur_fp = nullptr;
+            server_http_context::uploaded_file cur_file;
+            size_t cur_size = 0;
+            std::string cur_field_name;
+            std::string cur_field_value;
+            bool is_file = false;
+            bool too_large = false;
+
+            // Atomic counter for unique temp file names
+            static std::atomic<uint64_t> upload_counter{0};
+
+            content_reader(
+                // Part header callback
+                [&](const httplib::FormData & part) -> bool {
+                    // Finalize previous part
+                    if (cur_fp) {
+                        fclose(cur_fp);
+                        cur_file.size = cur_size;
+                        mreq.files.push_back(std::move(cur_file));
+                        cur_fp = nullptr;
+                        cur_size = 0;
+                    } else if (!cur_field_name.empty()) {
+                        mreq.fields[cur_field_name] = std::move(cur_field_value);
+                        cur_field_name.clear();
+                        cur_field_value.clear();
+                    }
+
+                    if (!part.filename.empty()) {
+                        // File part — stream to temp file
+                        is_file = true;
+                        cur_file = {};
+                        cur_file.field_name    = part.name;
+                        cur_file.filename      = part.filename;
+                        cur_file.content_type  = part.content_type;
+
+                        auto id = upload_counter.fetch_add(1);
+                        std::string ext;
+                        auto dot = part.filename.rfind('.');
+                        if (dot != std::string::npos) {
+                            ext = part.filename.substr(dot);
+                        }
+                        auto tmp = std::filesystem::temp_directory_path()
+                                 / ("llama_upload_" + std::to_string(id) + ext);
+                        cur_file.tmp_path = tmp.string();
+
+                        cur_fp = fopen(cur_file.tmp_path.c_str(), "wb");
+                        if (!cur_fp) {
+                            SRV_ERR("failed to create temp file: %s\n", cur_file.tmp_path.c_str());
+                            return false;
+                        }
+                    } else {
+                        // Text field
+                        is_file = false;
+                        cur_field_name = part.name;
+                        cur_field_value.clear();
+                    }
+                    return true;
+                },
+                // Data chunk callback
+                [&](const char * data, size_t len) -> bool {
+                    if (is_file && cur_fp) {
+                        cur_size += len;
+                        if (cur_size > max_file_size) {
+                            too_large = true;
+                            return false;
+                        }
+                        fwrite(data, 1, len, cur_fp);
+                    } else if (!is_file) {
+                        cur_field_value.append(data, len);
+                    }
+                    return true;
+                }
+            );
+
+            // Finalize last part
+            if (cur_fp) {
+                fclose(cur_fp);
+                cur_file.size = cur_size;
+                mreq.files.push_back(std::move(cur_file));
+            } else if (!cur_field_name.empty()) {
+                mreq.fields[cur_field_name] = std::move(cur_field_value);
+            }
+
+            if (too_large) {
+                for (const auto & f : mreq.files) {
+                    std::error_code ec;
+                    std::filesystem::remove(f.tmp_path, ec);
+                }
+                res.status = 413;
+                res.set_content(R"({"error":{"message":"File exceeds maximum upload size","type":"invalid_request_error"}})",
+                                "application/json");
+                return;
+            }
+
+            server_http_res_ptr response = handler(mreq);
+            res.status = response->status;
+            set_headers(res, response->headers);
+            res.set_content(response->data, response->content_type);
+        });
+}
+
 
 //
 // Vertex AI Prediction protocol (AIP_PREDICT_ROUTE)
@@ -674,13 +786,12 @@ void server_http_context::register_gcp_compat() const {
                         return build_error("no handler registered for @requestFormat: " + format, ERROR_TYPE_INVALID_REQUEST);
                     }
 
-                    const server_http_req internal_req {
+                    server_http_req internal_req = {
                         req.params,
                         req.headers,
                         path_prefix + dispatch_path,
                         req.query_string,
                         payload.dump(),
-                        {},
                         req.should_stop,
                     };
 

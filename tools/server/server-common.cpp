@@ -4,6 +4,7 @@
 #include "llama.h"
 #include "mtmd.h"
 #include "mtmd-helper.h"
+#include "mtmd-helper-video.h"
 #include "chat.h"
 #include "base64.hpp"
 
@@ -12,6 +13,8 @@
 #include <random>
 #include <sstream>
 #include <fstream>
+#include <filesystem>
+#include <atomic>
 
 json format_error_response(const std::string & message, const enum error_type type) {
     std::string type_str;
@@ -86,7 +89,6 @@ std::string gen_tool_call_id() {
 
 const char * get_media_marker() {
     static const std::string marker = []() {
-        // allow user to pin a reproducible marker via env var
         const char * env = getenv("LLAMA_MEDIA_MARKER");
         if (env && env[0] != '\0') {
             return std::string(env);
@@ -96,7 +98,59 @@ const char * get_media_marker() {
     return marker.c_str();
 }
 
-//
+// ============================================================================
+// Video upload store — manages streaming-uploaded temp files
+// ============================================================================
+
+video_upload_store g_video_uploads;
+
+std::string video_upload_store::add(const std::string & tmp_path, const std::string & filename,
+                                    const std::string & content_type, size_t size) {
+    std::string id = "vid_" + random_string();
+    video_upload_entry entry;
+    entry.id           = id;
+    entry.tmp_path     = tmp_path;
+    entry.filename     = filename;
+    entry.content_type = content_type;
+    entry.size         = size;
+    entry.created_at   = (int64_t)std::time(nullptr);
+
+    std::lock_guard<std::mutex> lock(mtx);
+    entries[id] = std::move(entry);
+    return id;
+}
+
+std::string video_upload_store::resolve(const std::string & id) const {
+    std::lock_guard<std::mutex> lock(mtx);
+    auto it = entries.find(id);
+    if (it == entries.end()) return "";
+    return it->second.tmp_path;
+}
+
+void video_upload_store::remove(const std::string & id) {
+    std::lock_guard<std::mutex> lock(mtx);
+    auto it = entries.find(id);
+    if (it != entries.end()) {
+        std::error_code ec;
+        std::filesystem::remove(it->second.tmp_path, ec);
+        entries.erase(it);
+    }
+}
+
+void video_upload_store::cleanup(int ttl_seconds) {
+    int64_t now = (int64_t)std::time(nullptr);
+    std::lock_guard<std::mutex> lock(mtx);
+    for (auto it = entries.begin(); it != entries.end(); ) {
+        if (now - it->second.created_at > ttl_seconds) {
+            std::error_code ec;
+            std::filesystem::remove(it->second.tmp_path, ec);
+            it = entries.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
 // lora utils
 //
 
@@ -391,6 +445,7 @@ void server_tokens::push_back(server_tokens & tokens) {
 }
 
 void server_tokens::insert(const llama_tokens & inp_tokens) {
+    GGML_ASSERT(!has_mtmd); // only allow this if mtmd is disabled
     tokens.insert(tokens.end(), inp_tokens.begin(), inp_tokens.end());
 }
 
@@ -399,15 +454,9 @@ const llama_tokens & server_tokens::get_tokens() const {
     return tokens;
 }
 
-llama_tokens server_tokens::get_text_tokens() const {
-    llama_tokens res;
-    res.reserve(tokens.size());
-    for (llama_token t : tokens) {
-        if (t != LLAMA_TOKEN_NULL) {
-            res.push_back(t);
-        }
-    }
-    return res;
+const llama_tokens & server_tokens::get_text_tokens() const {
+    GGML_ASSERT(!has_mtmd); // only allow this if mtmd is disabled
+    return tokens;
 }
 
 void server_tokens::set_token(llama_pos pos, llama_token id) {
@@ -713,9 +762,11 @@ static std::string fnv_hash(const uint8_t * data, size_t len) {
     return std::to_string(hash);
 }
 
-server_tokens process_mtmd_prompt(mtmd_context * mctx, std::string prompt, std::vector<raw_buffer> files) {
+server_tokens process_mtmd_prompt(mtmd_context * mctx, std::string prompt, std::vector<raw_buffer> files,
+                                  const std::vector<video_frame_meta> & video_frames) {
     mtmd::bitmaps bitmaps;
-    for (auto & file : files) {
+    for (size_t i = 0; i < files.size(); i++) {
+        auto & file = files[i];
         mtmd::bitmap bmp(mtmd_helper_bitmap_init_from_buf(mctx, file.data(), file.size()));
         if (!bmp.ptr) {
             throw std::runtime_error("Failed to load image or audio file");
@@ -723,6 +774,15 @@ server_tokens process_mtmd_prompt(mtmd_context * mctx, std::string prompt, std::
         // calculate bitmap hash (for KV caching)
         std::string hash = fnv_hash(bmp.data(), bmp.n_bytes());
         bmp.set_id(hash.c_str());
+
+        // Apply video frame metadata if this file index is tagged as a video frame
+        for (const auto & vf : video_frames) {
+            if (vf.file_idx == (int)i) {
+                mtmd_bitmap_set_video_frame(bmp.ptr.get(), vf.frame_idx, vf.n_frames_total, vf.timestamp_sec);
+                break;
+            }
+        }
+
         bitmaps.entries.push_back(std::move(bmp));
     }
     // process prompt
@@ -911,7 +971,8 @@ static void handle_media(
 json oaicompat_chat_params_parse(
     json & body, /* openai api json semantics */
     const server_chat_params & opt,
-    std::vector<raw_buffer> & out_files)
+    std::vector<raw_buffer> & out_files,
+    std::vector<video_frame_meta> & out_video_frames)
 {
     json llama_params;
 
@@ -947,9 +1008,7 @@ json oaicompat_chat_params_parse(
         json response_format      = json_value(body, "response_format", json::object());
         std::string response_type = json_value(response_format, "type", std::string());
         if (response_type == "json_object") {
-            if (response_format.contains("schema") || json_schema.empty()) {
-                json_schema = json_value(response_format, "schema", json::object());
-            }
+            json_schema = json_value(response_format, "schema", json::object());
         } else if (response_type == "json_schema") {
             auto schema_wrapper = json_value(response_format, "json_schema", json::object());
             json_schema = json_value(schema_wrapper, "schema", json::object());
@@ -999,7 +1058,7 @@ json oaicompat_chat_params_parse(
                 handle_media(out_files, image_url, opt.media_path);
 
                 p["type"] = "media_marker";
-                p["text"] = get_media_marker();
+                p["text"] = mtmd_default_marker();
                 p.erase("image_url");
 
             } else if (type == "input_audio") {
@@ -1020,16 +1079,172 @@ json oaicompat_chat_params_parse(
                 // TODO: add audio_url support by reusing handle_media()
 
                 p["type"] = "media_marker";
-                p["text"] = get_media_marker();
+                p["text"] = mtmd_default_marker();
                 p.erase("input_audio");
+
+            } else if (type == "video_url") {
+                if (!opt.allow_image) {
+                    throw std::runtime_error("video input is not supported - hint: vision model with mmproj is required for video");
+                }
+
+                json video_url_obj = json_value(p, "video_url", json::object());
+                std::string url = json_value(video_url_obj, "url", std::string());
+                int max_frames = json_value(video_url_obj, "max_frames", 0); // 0 = auto (fps-based)
+                float fps = json_value(video_url_obj, "fps", 0.0f); // 0 = default 2.0 fps
+                float scene_threshold = json_value(video_url_obj, "scene_threshold", 0.3f);
+
+                // Resolve URL to local path
+                std::string local_path;
+                bool local_path_is_temp = false; // true when we created this file and must delete it after use
+
+                if (string_starts_with(url, "data:")) {
+                    // Data URL: data:video/mp4;base64,<data>
+                    auto comma_pos = url.find(',');
+                    if (comma_pos == std::string::npos) {
+                        throw std::invalid_argument("Invalid data URL for video");
+                    }
+                    std::string header = url.substr(5, comma_pos - 5); // after "data:"
+                    std::string base64_data = url.substr(comma_pos + 1);
+
+                    // Determine extension from MIME type
+                    std::string ext = ".mp4"; // default
+                    if (header.find("video/webm") != std::string::npos) ext = ".webm";
+                    else if (header.find("video/avi") != std::string::npos) ext = ".avi";
+                    else if (header.find("video/quicktime") != std::string::npos) ext = ".mov";
+
+                    // Decode base64
+                    if (base64_data.size() < 16) {
+                        throw std::runtime_error("Video base64 data is too small (" + std::to_string(base64_data.size()) + " chars)");
+                    }
+                    std::vector<uint8_t> decoded = base64_decode(base64_data);
+                    if (decoded.size() < 1024) {
+                        throw std::runtime_error("Decoded video data too small (" + std::to_string(decoded.size()) + " bytes)");
+                    }
+
+                    static std::atomic<uint64_t> data_url_counter{0};
+                    auto uid = data_url_counter.fetch_add(1);
+                    std::filesystem::path tmp_fspath =
+                        std::filesystem::temp_directory_path() /
+                        ("llama_video_upload_" + std::to_string(uid) + ext);
+                    local_path = tmp_fspath.string();
+                    local_path_is_temp = true;
+                    std::ofstream tmp_file(tmp_fspath, std::ios::binary);
+                    if (!tmp_file.is_open()) {
+                        throw std::runtime_error("Failed to create temp video file: " + local_path);
+                    }
+                    tmp_file.write(reinterpret_cast<const char *>(decoded.data()), decoded.size());
+                    if (!tmp_file.good()) {
+                        tmp_file.close();
+                        std::error_code ec; std::filesystem::remove(tmp_fspath, ec);
+                        throw std::runtime_error("Failed to write video data to: " + local_path);
+                    }
+                    tmp_file.close();
+                    SRV_INF("video data URL decoded to temp: %s (%zu bytes)\n", local_path.c_str(), decoded.size());
+
+                } else if (string_starts_with(url, "upload://")) {
+                    // Resolve streaming upload reference
+                    std::string upload_id = url.substr(9); // after "upload://"
+                    local_path = g_video_uploads.resolve(upload_id);
+                    if (local_path.empty()) {
+                        throw std::invalid_argument("upload not found or expired: " + upload_id);
+                    }
+                    SRV_INF("resolved upload://%s -> %s\n", upload_id.c_str(), local_path.c_str());
+
+                } else if (string_starts_with(url, "http")) {
+                    // Download to temp file
+                    common_remote_params dl_params;
+                    dl_params.max_size = (size_t)2 * 1024 * 1024 * 1024; // 2GB for video
+                    dl_params.timeout  = 300; // 5 min for video download
+                    SRV_INF("downloading video from '%s'\n", url.c_str());
+                    auto dl_res = common_remote_get_content(url, dl_params);
+                    if (200 <= dl_res.first && dl_res.first < 300) {
+                        static std::atomic<uint64_t> http_dl_counter{0};
+                        auto uid = http_dl_counter.fetch_add(1);
+                        std::string tmp_filename = "llama_video_dl_" + std::to_string(uid) + ".mp4";
+                        std::filesystem::path tmp_fspath =
+                            std::filesystem::temp_directory_path() / tmp_filename;
+                        local_path = tmp_fspath.string();
+                        local_path_is_temp = true;
+                        std::ofstream tmp_file(tmp_fspath, std::ios::binary);
+                        tmp_file.write(reinterpret_cast<const char *>(dl_res.second.data()), dl_res.second.size());
+                        if (!tmp_file.good()) {
+                            tmp_file.close();
+                            std::error_code ec; std::filesystem::remove(tmp_fspath, ec);
+                            throw std::runtime_error("Failed to write downloaded video to: " + local_path);
+                        }
+                        tmp_file.close();
+                        SRV_INF("video saved to temp: %s (%zu bytes)\n", local_path.c_str(), dl_res.second.size());
+                    } else {
+                        throw std::runtime_error("Failed to download video from: " + url);
+                    }
+                } else {
+                    // Assume local path directly
+                    local_path = url;
+                }
+
+                // Extract video frames
+                auto * video = mtmd_video_load(local_path.c_str(), max_frames, fps, scene_threshold);
+                if (!video) {
+                    if (local_path_is_temp) {
+                        std::error_code ec;
+                        std::filesystem::remove(local_path, ec);
+                    }
+                    throw std::runtime_error("Failed to extract frames from video: " + local_path);
+                }
+
+                SRV_INF("extracted %d frames from video (duration=%.1fs, sample_fps=%.2f)\n",
+                        video->n_frames, video->duration_sec, video->sample_fps);
+
+                // Load each frame PNG into out_files as raw buffers and record video frame metadata
+                int n_total = video->n_frames;
+                for (int fi = 0; fi < video->n_frames; fi++) {
+                    unsigned char * png_buf = nullptr;
+                    size_t png_size = mtmd_video_frame_read_png(&video->frames[fi], &png_buf);
+                    if (png_size == 0 || !png_buf) {
+                        SRV_ERR("failed to read frame %d PNG\n", fi);
+                        mtmd_video_free(video);
+                        if (local_path_is_temp) {
+                            std::error_code ec;
+                            std::filesystem::remove(local_path, ec);
+                        }
+                        throw std::runtime_error("Failed to read video frame PNG");
+                    }
+                    raw_buffer frame_data(png_buf, png_buf + png_size);
+                    free(png_buf);
+
+                    video_frame_meta vfm;
+                    vfm.file_idx       = (int)out_files.size();
+                    vfm.frame_idx      = fi;
+                    vfm.n_frames_total = n_total;
+                    vfm.timestamp_sec  = video->frames[fi].timestamp_sec;
+                    out_video_frames.push_back(vfm);
+
+                    out_files.push_back(std::move(frame_data));
+                }
+
+                // Replace with media markers (one per frame)
+                std::string markers;
+                for (int fi = 0; fi < video->n_frames; fi++) {
+                    markers += mtmd_default_marker();
+                }
+
+                p["type"] = "media_marker";
+                p["text"] = markers;
+                p.erase("video_url");
+
+                mtmd_video_free(video);
+
+                // Clean up the temp input video file (data URL or HTTP download paths)
+                if (local_path_is_temp) {
+                    std::error_code ec;
+                    std::filesystem::remove(local_path, ec);
+                }
 
             } else if (type != "text") {
                 throw std::invalid_argument("unsupported content[].type");
             }
         }
     }
-
-    auto caps = common_chat_templates_get_caps(opt.tmpls.get());
 
     common_chat_templates_inputs inputs;
     inputs.messages               = common_chat_msgs_parse_oaicompat(messages);
@@ -1038,7 +1253,7 @@ json oaicompat_chat_params_parse(
     inputs.json_schema            = json_schema.is_null() ? "" : json_schema.dump();
     inputs.grammar                = grammar;
     inputs.use_jinja              = opt.use_jinja;
-    inputs.parallel_tool_calls    = json_value(body, "parallel_tool_calls", caps["supports_parallel_tool_calls"]);
+    inputs.parallel_tool_calls    = json_value(body, "parallel_tool_calls", false);
     inputs.add_generation_prompt  = json_value(body, "add_generation_prompt", true);
     inputs.continue_final_message = body.contains("continue_final_message") ?
         common_chat_continuation_parse(body.at("continue_final_message")) :
@@ -1157,6 +1372,491 @@ json oaicompat_chat_params_parse(
     }
 
     return llama_params;
+}
+
+json convert_responses_to_chatcmpl(const json & response_body) {
+    if (!response_body.contains("input")) {
+        throw std::invalid_argument("'input' is required");
+    }
+    if (!json_value(response_body, "previous_response_id", std::string{}).empty()) {
+        throw std::invalid_argument("llama.cpp does not support 'previous_response_id'.");
+    }
+
+    const json input_value = response_body.at("input");
+    json chatcmpl_body = response_body;
+    chatcmpl_body.erase("input");
+    std::vector<json> chatcmpl_messages;
+
+    if (response_body.contains("instructions")) {
+        chatcmpl_messages.push_back({
+            {"role",    "system"},
+            {"content", json_value(response_body, "instructions", std::string())},
+        });
+        chatcmpl_body.erase("instructions");
+    }
+
+    if (input_value.is_string()) {
+        // #responses_create-input-text_input
+        chatcmpl_messages.push_back({
+            {"role",    "user"},
+            {"content", input_value},
+        });
+    } else if (input_value.is_array()) {
+        // #responses_create-input-input_item_list
+
+        static auto exists_and_is_array = [](const json & j, const char * key) -> bool {
+            return j.contains(key) && j.at(key).is_array();
+        };
+        static auto exists_and_is_string = [](const json & j, const char * key) -> bool {
+            return j.contains(key) && j.at(key).is_string();
+        };
+
+        for (json item : input_value) {
+            bool merge_prev = !chatcmpl_messages.empty() && chatcmpl_messages.back().value("role", "") == "assistant";
+
+            if (exists_and_is_string(item, "content")) {
+                // #responses_create-input-input_item_list-input_message-content-text_input
+                item["content"] = json::array({
+                    json {
+                        {"text", item.at("content")},
+                        {"type", "input_text"}
+                    }
+                });
+            }
+
+            if (exists_and_is_array(item, "content") &&
+                exists_and_is_string(item, "role") &&
+                (item.at("role") == "user" ||
+                    item.at("role") == "system" ||
+                    item.at("role") == "developer")
+            ) {
+                // #responses_create-input-input_item_list-item-input_message
+                std::vector<json> chatcmpl_content;
+
+                for (const json & input_item : item.at("content")) {
+                    const std::string type = json_value(input_item, "type", std::string());
+
+                    if (type == "input_text") {
+                        if (!input_item.contains("text")) {
+                            throw std::invalid_argument("'Input text' requires 'text'");
+                        }
+                        chatcmpl_content.push_back({
+                            {"text", input_item.at("text")},
+                            {"type", "text"},
+                        });
+                    } else if (type == "input_image") {
+                        if (!input_item.contains("image_url")) {
+                            throw std::invalid_argument("'image_url' is required");
+                        }
+                        chatcmpl_content.push_back({
+                            {"image_url", json {
+                                {"url", input_item.at("image_url")}
+                            }},
+                            {"type", "image_url"},
+                        });
+                    } else if (type == "input_file") {
+                        throw std::invalid_argument("'input_file' is not supported by llamacpp at this moment");
+                    } else {
+                        throw std::invalid_argument("'type' must be one of 'input_text', 'input_image', or 'input_file'");
+                    }
+                }
+
+                if (item.contains("type")) {
+                    item.erase("type");
+                }
+                if (item.contains("status")) {
+                    item.erase("status");
+                }
+                item["content"] = chatcmpl_content;
+
+                chatcmpl_messages.push_back(item);
+            } else if (exists_and_is_array(item, "content") &&
+                exists_and_is_string(item, "role") &&
+                item.at("role") == "assistant" &&
+                exists_and_is_string(item, "type") &&
+                item.at("type") == "message"
+            ) {
+                // #responses_create-input-input_item_list-item-output_message
+                auto chatcmpl_content = json::array();
+
+                for (const auto & output_text : item.at("content")) {
+                    const std::string type = json_value(output_text, "type", std::string());
+                    if (type == "output_text") {
+                        if (!exists_and_is_string(output_text, "text")) {
+                            throw std::invalid_argument("'Output text' requires 'text'");
+                        }
+                        chatcmpl_content.push_back({
+                            {"text", output_text.at("text")},
+                            {"type", "text"},
+                        });
+                    } else if (type == "refusal") {
+                        if (!exists_and_is_string(output_text, "refusal")) {
+                            throw std::invalid_argument("'Refusal' requires 'refusal'");
+                        }
+                        chatcmpl_content.push_back({
+                            {"refusal", output_text.at("refusal")},
+                            {"type", "refusal"},
+                        });
+                    } else {
+                        throw std::invalid_argument("'type' must be one of 'output_text' or 'refusal'");
+                    }
+                }
+
+                if (merge_prev) {
+                    auto & prev_msg = chatcmpl_messages.back();
+                    if (!exists_and_is_array(prev_msg, "content")) {
+                        prev_msg["content"] = json::array();
+                    }
+                    auto & prev_content = prev_msg["content"];
+                    prev_content.insert(prev_content.end(), chatcmpl_content.begin(), chatcmpl_content.end());
+                } else {
+                    item.erase("status");
+                    item.erase("type");
+                    item["content"] = chatcmpl_content;
+                    chatcmpl_messages.push_back(item);
+                }
+            } else if (exists_and_is_string(item, "arguments") &&
+                exists_and_is_string(item, "call_id") &&
+                exists_and_is_string(item, "name") &&
+                exists_and_is_string(item, "type") &&
+                item.at("type") == "function_call"
+            ) {
+                // #responses_create-input-input_item_list-item-function_tool_call
+                json tool_call = {
+                    {"function", json {
+                        {"arguments", item.at("arguments")},
+                        {"name",      item.at("name")},
+                    }},
+                    {"id",   item.at("call_id")},
+                    {"type", "function"},
+                };
+
+                if (merge_prev) {
+                    auto & prev_msg = chatcmpl_messages.back();
+                    if (!exists_and_is_array(prev_msg, "tool_calls")) {
+                        prev_msg["tool_calls"] = json::array();
+                    }
+                    prev_msg["tool_calls"].push_back(tool_call);
+                } else {
+                    chatcmpl_messages.push_back(json {
+                        {"role",       "assistant"},
+                        {"tool_calls", json::array({tool_call})}
+                    });
+                }
+            } else if (exists_and_is_string(item, "call_id") &&
+                (exists_and_is_string(item, "output") || exists_and_is_array(item, "output")) &&
+                exists_and_is_string(item, "type") &&
+                item.at("type") == "function_call_output"
+            ) {
+                // #responses_create-input-input_item_list-item-function_tool_call_output
+                if (item.at("output").is_string()) {
+                    chatcmpl_messages.push_back(json {
+                        {"content",      item.at("output")},
+                        {"role",         "tool"},
+                        {"tool_call_id", item.at("call_id")},
+                    });
+                } else {
+                    json chatcmpl_outputs = item.at("output");
+                    for (json & chatcmpl_output : chatcmpl_outputs) {
+                        if (!chatcmpl_output.contains("type") || chatcmpl_output.at("type") != "input_text") {
+                            throw std::invalid_argument("Output of tool call should be 'Input text'");
+                        }
+                        chatcmpl_output["type"] = "text";
+                    }
+                    chatcmpl_messages.push_back(json {
+                        {"content",      chatcmpl_outputs},
+                        {"role",         "tool"},
+                        {"tool_call_id", item.at("call_id")},
+                    });
+                }
+            } else if (
+                exists_and_is_array(item, "summary") &&
+                exists_and_is_string(item, "type") &&
+                item.at("type") == "reasoning") {
+                // #responses_create-input-input_item_list-item-reasoning
+
+                if (!exists_and_is_array(item, "content")) {
+                    throw std::invalid_argument("item['content'] is not an array");
+                }
+                if (item.at("content").empty()) {
+                    throw std::invalid_argument("item['content'] is empty");
+                }
+                if (!exists_and_is_string(item.at("content")[0], "text")) {
+                    throw std::invalid_argument("item['content']['text'] is not a string");
+                }
+
+                if (merge_prev) {
+                    auto & prev_msg = chatcmpl_messages.back();
+                    prev_msg["reasoning_content"] = item.at("content")[0].at("text");
+                } else {
+                    chatcmpl_messages.push_back(json {
+                        {"role", "assistant"},
+                        {"content", json::array()},
+                        {"reasoning_content", item.at("content")[0].at("text")},
+                    });
+                }
+            } else {
+                throw std::invalid_argument("Cannot determine type of 'item'");
+            }
+        }
+    } else {
+        throw std::invalid_argument("'input' must be a string or array of objects");
+    }
+
+    chatcmpl_body["messages"] = chatcmpl_messages;
+
+    if (response_body.contains("tools")) {
+        if (!response_body.at("tools").is_array()) {
+            throw std::invalid_argument("'tools' must be an array of objects");
+        }
+        std::vector<json> chatcmpl_tools;
+        for (json resp_tool : response_body.at("tools")) {
+            json chatcmpl_tool;
+
+            if (json_value(resp_tool, "type", std::string()) != "function") {
+                throw std::invalid_argument("'type' of tool must be 'function'");
+            }
+            resp_tool.erase("type");
+            chatcmpl_tool["type"] = "function";
+
+            if (!resp_tool.contains("strict")) {
+                resp_tool["strict"] = true;
+            }
+            chatcmpl_tool["function"] = resp_tool;
+            chatcmpl_tools.push_back(chatcmpl_tool);
+        }
+        chatcmpl_body.erase("tools");
+        chatcmpl_body["tools"] = chatcmpl_tools;
+    }
+
+    if (response_body.contains("max_output_tokens")) {
+        chatcmpl_body.erase("max_output_tokens");
+        chatcmpl_body["max_tokens"] = response_body["max_output_tokens"];
+    }
+
+    return chatcmpl_body;
+}
+
+json convert_anthropic_to_oai(const json & body) {
+    json oai_body;
+
+    // Convert system prompt
+    json oai_messages = json::array();
+    auto system_param = json_value(body, "system", json());
+    if (!system_param.is_null()) {
+        std::string system_content;
+
+        if (system_param.is_string()) {
+            system_content = system_param.get<std::string>();
+        } else if (system_param.is_array()) {
+            for (const auto & block : system_param) {
+                if (json_value(block, "type", std::string()) == "text") {
+                    system_content += json_value(block, "text", std::string());
+                }
+            }
+        }
+
+        oai_messages.push_back({
+            {"role", "system"},
+            {"content", system_content}
+        });
+    }
+
+    // Convert messages
+    if (!body.contains("messages")) {
+        throw std::runtime_error("'messages' is required");
+    }
+    const json & messages = body.at("messages");
+    if (messages.is_array()) {
+        for (const auto & msg : messages) {
+            std::string role = json_value(msg, "role", std::string());
+
+            if (!msg.contains("content")) {
+                if (role == "assistant") {
+                    continue;
+                }
+                oai_messages.push_back(msg);
+                continue;
+            }
+
+            const json & content = msg.at("content");
+
+            if (content.is_string()) {
+                oai_messages.push_back(msg);
+                continue;
+            }
+
+            if (!content.is_array()) {
+                oai_messages.push_back(msg);
+                continue;
+            }
+
+            json tool_calls = json::array();
+            json converted_content = json::array();
+            json tool_results = json::array();
+            std::string reasoning_content;
+            bool has_tool_calls = false;
+
+            for (const auto & block : content) {
+                std::string type = json_value(block, "type", std::string());
+
+                if (type == "text") {
+                    converted_content.push_back(block);
+                } else if (type == "thinking") {
+                    reasoning_content += json_value(block, "thinking", std::string());
+                } else if (type == "image") {
+                    json source = json_value(block, "source", json::object());
+                    std::string source_type = json_value(source, "type", std::string());
+
+                    if (source_type == "base64") {
+                        std::string media_type = json_value(source, "media_type", std::string("image/jpeg"));
+                        std::string data = json_value(source, "data", std::string());
+                        std::ostringstream ss;
+                        ss << "data:" << media_type << ";base64," << data;
+
+                        converted_content.push_back({
+                            {"type", "image_url"},
+                            {"image_url", {
+                                {"url", ss.str()}
+                            }}
+                        });
+                    } else if (source_type == "url") {
+                        std::string url = json_value(source, "url", std::string());
+                        converted_content.push_back({
+                            {"type", "image_url"},
+                            {"image_url", {
+                                {"url", url}
+                            }}
+                        });
+                    }
+                } else if (type == "tool_use") {
+                    tool_calls.push_back({
+                        {"id", json_value(block, "id", std::string())},
+                        {"type", "function"},
+                        {"function", {
+                            {"name", json_value(block, "name", std::string())},
+                            {"arguments", json_value(block, "input", json::object()).dump()}
+                        }}
+                    });
+                    has_tool_calls = true;
+                } else if (type == "tool_result") {
+                    std::string tool_use_id = json_value(block, "tool_use_id", std::string());
+
+                    auto result_content = json_value(block, "content", json());
+                    std::string result_text;
+                    if (result_content.is_string()) {
+                        result_text = result_content.get<std::string>();
+                    } else if (result_content.is_array()) {
+                        for (const auto & c : result_content) {
+                            if (json_value(c, "type", std::string()) == "text") {
+                                result_text += json_value(c, "text", std::string());
+                            }
+                        }
+                    }
+
+                    tool_results.push_back({
+                        {"role", "tool"},
+                        {"tool_call_id", tool_use_id},
+                        {"content", result_text}
+                    });
+                }
+            }
+
+            if (!converted_content.empty() || has_tool_calls || !reasoning_content.empty()) {
+                json new_msg = {{"role", role}};
+                if (!converted_content.empty()) {
+                    new_msg["content"] = converted_content;
+                } else if (has_tool_calls || !reasoning_content.empty()) {
+                    new_msg["content"] = "";
+                }
+                if (!tool_calls.empty()) {
+                    new_msg["tool_calls"] = tool_calls;
+                }
+                if (!reasoning_content.empty()) {
+                    new_msg["reasoning_content"] = reasoning_content;
+                }
+                oai_messages.push_back(new_msg);
+            }
+
+            for (const auto & tool_msg : tool_results) {
+                oai_messages.push_back(tool_msg);
+            }
+        }
+    }
+
+    oai_body["messages"] = oai_messages;
+
+    // Convert tools
+    if (body.contains("tools")) {
+        const json & tools = body.at("tools");
+        if (tools.is_array()) {
+            json oai_tools = json::array();
+            for (const auto & tool : tools) {
+                oai_tools.push_back({
+                    {"type", "function"},
+                    {"function", {
+                        {"name", json_value(tool, "name", std::string())},
+                        {"description", json_value(tool, "description", std::string())},
+                        {"parameters", tool.contains("input_schema") ? tool.at("input_schema") : json::object()}
+                    }}
+                });
+            }
+            oai_body["tools"] = oai_tools;
+        }
+    }
+
+    // Convert tool_choice
+    if (body.contains("tool_choice")) {
+        const json & tc = body.at("tool_choice");
+        if (tc.is_object()) {
+            std::string type = json_value(tc, "type", std::string());
+            if (type == "auto") {
+                oai_body["tool_choice"] = "auto";
+            } else if (type == "any" || type == "tool") {
+                oai_body["tool_choice"] = "required";
+            }
+        }
+    }
+
+    // Convert stop_sequences to stop
+    if (body.contains("stop_sequences")) {
+        oai_body["stop"] = body.at("stop_sequences");
+    }
+
+    // Handle max_tokens (required in Anthropic, but we're permissive)
+    if (body.contains("max_tokens")) {
+        oai_body["max_tokens"] = body.at("max_tokens");
+    } else {
+        oai_body["max_tokens"] = 4096;
+    }
+
+    // Pass through common params
+    for (const auto & key : {"temperature", "top_p", "top_k", "stream"}) {
+        if (body.contains(key)) {
+            oai_body[key] = body.at(key);
+        }
+    }
+
+    // Handle Anthropic-specific thinking param
+    if (body.contains("thinking")) {
+        json thinking = json_value(body, "thinking", json::object());
+        std::string thinking_type = json_value(thinking, "type", std::string());
+        if (thinking_type == "enabled") {
+            int budget_tokens = json_value(thinking, "budget_tokens", 10000);
+            oai_body["thinking_budget_tokens"] = budget_tokens;
+        }
+    }
+
+    // Handle Anthropic-specific metadata param
+    if (body.contains("metadata")) {
+        json metadata = json_value(body, "metadata", json::object());
+        std::string user_id = json_value(metadata, "user_id", std::string());
+        if (!user_id.empty()) {
+            oai_body["__metadata_user_id"] = user_id;
+        }
+    }
+
+    return oai_body;
 }
 
 json format_embeddings_response_oaicompat(

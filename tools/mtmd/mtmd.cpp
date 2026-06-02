@@ -32,6 +32,12 @@ struct mtmd_bitmap {
     std::vector<unsigned char> data;
     std::string id; // optional user-defined id, for ex: can be set to image hash, useful for KV cache tracking
     bool is_audio = false; // true if the bitmap is audio
+
+    // video frame metadata (optional; only populated when processing video)
+    bool  is_video       = false;
+    int   frame_idx      = 0;    // 0-based frame index within the video
+    int   n_frames_total = 0;    // total frames extracted from the video
+    float timestamp_sec  = 0.0f; // frame timestamp in seconds
 };
 
 // position indexing for decoder model
@@ -1226,6 +1232,15 @@ void mtmd_bitmap_set_id(mtmd_bitmap * bitmap, const char * id) {
         bitmap->id = std::string(id);
     } else {
         bitmap->id.clear();
+    }
+}
+
+void mtmd_bitmap_set_video_frame(mtmd_bitmap * bitmap, int frame_idx, int n_frames_total, float timestamp_sec) {
+    if (bitmap) {
+        bitmap->is_video       = true;
+        bitmap->frame_idx      = frame_idx;
+        bitmap->n_frames_total = n_frames_total;
+        bitmap->timestamp_sec  = timestamp_sec;
     }
 }
 

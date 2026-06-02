@@ -6,7 +6,6 @@
 #include <string>
 #include <thread>
 #include <vector>
-#include <cstdint>
 
 struct common_params;
 
@@ -36,19 +35,12 @@ struct server_http_res {
 using server_http_res_ptr = std::unique_ptr<server_http_res>;
 using raw_buffer = std::vector<uint8_t>;
 
-struct uploaded_file {
-    raw_buffer data;
-    std::string filename;
-    std::string content_type;
-};
-
 struct server_http_req {
     std::map<std::string, std::string> params; // path_params + query_params
     std::map<std::string, std::string> headers; // used by MCP proxy
     std::string path;
     std::string query_string; // query parameters string (e.g. "action=save")
     std::string body;
-    std::map<std::string, uploaded_file> files; // used for file uploads (form data)
     const std::function<bool()> & should_stop;
 
     std::string get_param(const std::string & key, const std::string & def = "") const {
@@ -85,6 +77,30 @@ struct server_http_context {
 
     void get(const std::string & path, const handler_t & handler) const;
     void post(const std::string & path, const handler_t & handler) const;
+
+    // Streaming multipart upload — files are streamed to disk (not buffered in memory)
+    struct uploaded_file {
+        std::string field_name;    // form field name (e.g. "video")
+        std::string filename;      // original filename from client
+        std::string content_type;  // MIME type
+        std::string tmp_path;      // path to temp file on disk
+        size_t      size = 0;      // bytes written
+    };
+
+    struct multipart_req {
+        std::map<std::string, std::string> params;
+        std::map<std::string, std::string> headers;
+        std::map<std::string, std::string> fields;  // text form fields
+        std::vector<uploaded_file> files;            // uploaded files (on disk)
+        std::string path;
+        std::string query_string;
+        std::function<bool()> is_closed;
+    };
+
+    using multipart_handler_t = std::function<server_http_res_ptr(const multipart_req & req)>;
+
+    // max_file_size: maximum bytes per file (0 = 2GB default)
+    void post_multipart(const std::string & path, const multipart_handler_t & handler, size_t max_file_size = 0) const;
 
     // Register the Google Cloud Platform (Vertex AI) compat (AIP_PREDICT_ROUTE env var, or /predict)
     // Must be called AFTER all other API routes are registered

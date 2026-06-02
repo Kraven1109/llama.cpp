@@ -149,6 +149,9 @@ MTMD_API void                  mtmd_bitmap_free       (mtmd_bitmap * bitmap);
 MTMD_API const char * mtmd_bitmap_get_id(const mtmd_bitmap * bitmap);
 MTMD_API void         mtmd_bitmap_set_id(mtmd_bitmap * bitmap, const char * id);
 
+// set video frame metadata on a bitmap; marks bitmap as video frame
+MTMD_API void         mtmd_bitmap_set_video_frame(mtmd_bitmap * bitmap, int frame_idx, int n_frames_total, float timestamp_sec);
+
 
 // mtmd_input_chunks
 //

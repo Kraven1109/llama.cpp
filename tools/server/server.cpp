@@ -3,9 +3,9 @@
 #include "server-models.h"
 #include "server-cors-proxy.h"
 #include "server-tools.h"
+#include "server-common.h"
 
 #include "arg.h"
-#include "build-info.h"
 #include "common.h"
 #include "fit.h"
 #include "llama.h"
@@ -14,6 +14,7 @@
 #include <atomic>
 #include <clocale>
 #include <exception>
+#include <filesystem>
 #include <signal.h>
 #include <thread> // for std::thread::hardware_concurrency
 
@@ -67,6 +68,28 @@ static server_http_context::handler_t ex_wrapper(server_http_context::handler_t 
             SRV_ERR("got another exception: %s | while handling exception: %s\n", e.what(), message.c_str());
             res->data = "Internal Server Error";
         }
+        return res;
+    };
+}
+
+static server_http_context::multipart_handler_t multipart_ex_wrapper(server_http_context::multipart_handler_t func) {
+    return [func = std::move(func)](const server_http_context::multipart_req & req) -> server_http_res_ptr {
+        std::string message;
+        error_type error;
+        try {
+            return func(req);
+        } catch (const std::invalid_argument & e) {
+            // treat invalid_argument as invalid request (400)
+            error = ERROR_TYPE_INVALID_REQUEST;
+            message = e.what();
+        } catch (const std::exception & e) {
+            // treat other exceptions as server error (500)
+            error = ERROR_TYPE_SERVER;
+            message = e.what();
+        }
+        auto res = std::make_unique<server_http_res>();
+        res->status = error == ERROR_TYPE_INVALID_REQUEST ? 400 : 500;
+        res->data = format_error_response(message, error).dump();
         return res;
     };
 }
@@ -150,7 +173,6 @@ int llama_server(int argc, char ** argv) {
         routes.post_completions_oai        = models_routes->proxy_post;
         routes.post_chat_completions       = models_routes->proxy_post;
         routes.post_responses_oai          = models_routes->proxy_post;
-        routes.post_transcriptions_oai     = models_routes->proxy_post;
         routes.post_anthropic_messages     = models_routes->proxy_post;
         routes.post_anthropic_count_tokens = models_routes->proxy_post;
         routes.post_infill                 = models_routes->proxy_post;
@@ -187,8 +209,8 @@ int llama_server(int argc, char ** argv) {
     ctx_http.post("/v1/chat/completions",      ex_wrapper(routes.post_chat_completions));
     ctx_http.post("/v1/responses",             ex_wrapper(routes.post_responses_oai));
     ctx_http.post("/responses",                ex_wrapper(routes.post_responses_oai));
-    ctx_http.post("/v1/audio/transcriptions",  ex_wrapper(routes.post_transcriptions_oai));
-    ctx_http.post("/audio/transcriptions",     ex_wrapper(routes.post_transcriptions_oai));
+    ctx_http.post_multipart("/v1/audio/transcriptions", multipart_ex_wrapper(routes.post_transcriptions_oai));
+    ctx_http.post_multipart("/audio/transcriptions",    multipart_ex_wrapper(routes.post_transcriptions_oai));
     ctx_http.post("/v1/messages",              ex_wrapper(routes.post_anthropic_messages)); // anthropic messages API
     ctx_http.post("/v1/messages/count_tokens", ex_wrapper(routes.post_anthropic_count_tokens)); // anthropic token counting
     ctx_http.post("/infill",                   ex_wrapper(routes.post_infill));
@@ -208,6 +230,66 @@ int llama_server(int argc, char ** argv) {
     // Save & load slots
     ctx_http.get ("/slots",                    ex_wrapper(routes.get_slots));
     ctx_http.post("/slots/:id_slot",           ex_wrapper(routes.post_slots));
+
+    // Streaming video upload — files are streamed to disk, never buffered in memory
+    // Returns an upload ID that can be used as video_url: "upload://<id>" in chat completions
+    ctx_http.post_multipart("/v1/upload/video",
+        [&params](const server_http_context::multipart_req & req) -> server_http_res_ptr {
+            auto res = std::make_unique<server_http_res>();
+
+            if (req.files.empty()) {
+                res->status = 400;
+                res->data = R"({"error":{"message":"No file uploaded. Send multipart/form-data with a 'video' field.","type":"invalid_request_error"}})";
+                return res;
+            }
+
+            // Use the first file
+            const auto & file = req.files[0];
+            SRV_INF("video upload received: %s (%zu bytes, type=%s)\n",
+                    file.filename.c_str(), file.size, file.content_type.c_str());
+
+            // Validate it looks like a video file
+            bool is_video = file.content_type.find("video/") == 0;
+            if (!is_video) {
+                // Check extension as fallback
+                std::string fn = file.filename;
+                std::transform(fn.begin(), fn.end(), fn.begin(), ::tolower);
+                is_video = fn.find(".mp4") != std::string::npos ||
+                           fn.find(".webm") != std::string::npos ||
+                           fn.find(".mov") != std::string::npos ||
+                           fn.find(".avi") != std::string::npos ||
+                           fn.find(".mkv") != std::string::npos;
+            }
+            if (!is_video) {
+                // Clean up the temp file
+                std::error_code ec;
+                std::filesystem::remove(file.tmp_path, ec);
+                res->status = 400;
+                res->data = R"({"error":{"message":"Uploaded file does not appear to be a video","type":"invalid_request_error"}})";
+                return res;
+            }
+
+            // Register in upload store
+            std::string upload_id = g_video_uploads.add(
+                file.tmp_path, file.filename, file.content_type, file.size);
+
+            // Periodic cleanup of old uploads (>1 hour)
+            g_video_uploads.cleanup(3600);
+
+            json result = {
+                {"id",           upload_id},
+                {"object",       "video.upload"},
+                {"filename",     file.filename},
+                {"content_type", file.content_type},
+                {"size",         file.size},
+                {"video_url",    "upload://" + upload_id},
+            };
+
+            res->status = 200;
+            res->data = result.dump();
+            SRV_INF("video upload stored: id=%s path=%s\n", upload_id.c_str(), file.tmp_path.c_str());
+            return res;
+        });
 
     // Google Cloud Platform (Vertex AI) compat
     ctx_http.register_gcp_compat();
@@ -365,3 +447,4 @@ int llama_server(int argc, char ** argv) {
 
     return 0;
 }
+

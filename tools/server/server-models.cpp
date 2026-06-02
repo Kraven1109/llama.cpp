@@ -1,6 +1,9 @@
 #include "server-common.h"
 #include "server-models.h"
 
+#include <fstream>
+#include <regex>
+
 #include "build-info.h"
 #include "preset.h"
 #include "download.h"
@@ -1050,7 +1053,7 @@ server_http_res_ptr server_models::proxy_request(const server_http_req & req, co
             proxy_path,
             req.headers,
             req.body,
-            req.files,
+            std::map<std::string, server_http_context::uploaded_file>(), // dummy empty map
             req.should_stop,
             base_params.timeout_read,
             base_params.timeout_write
@@ -1403,7 +1406,7 @@ static std::string generate_multipart_boundary() {
 
 static std::string build_multipart_body(
         const json & form_fields,
-        const std::map<std::string, uploaded_file> & files,
+        const std::map<std::string, server_http_context::uploaded_file> & files,
         const std::string & boundary) {
     static auto sanitize_field = [](const std::string & text) {
         std::string result;
@@ -1453,7 +1456,12 @@ static std::string build_multipart_body(
             body << "Content-Type: application/octet-stream\r\n";
         }
         body << "\r\n";
-        body.write(reinterpret_cast<const char*>(file.data.data()), file.data.size());
+
+        std::ifstream tmp_file(file.tmp_path, std::ios::binary);
+        if (tmp_file) {
+            body << tmp_file.rdbuf();
+        }
+
         body << "\r\n";
     }
 
@@ -1469,7 +1477,7 @@ server_http_proxy::server_http_proxy(
         const std::string & path,
         const std::map<std::string, std::string> & headers,
         const std::string & body,
-        const std::map<std::string, uploaded_file> & files,
+        const std::map<std::string, server_http_context::uploaded_file> & files,
         const std::function<bool()> should_stop,
         int32_t timeout_read,
         int32_t timeout_write
