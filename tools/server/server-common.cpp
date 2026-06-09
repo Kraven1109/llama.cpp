@@ -1063,7 +1063,7 @@ json oaicompat_chat_params_parse(
                 handle_media(out_files, image_url, opt.media_path);
 
                 p["type"] = "media_marker";
-                p["text"] = mtmd_default_marker();
+                p["text"] = get_media_marker();
                 p.erase("image_url");
 
             } else if (type == "input_audio") {
@@ -1084,7 +1084,7 @@ json oaicompat_chat_params_parse(
                 // TODO: add audio_url support by reusing handle_media()
 
                 p["type"] = "media_marker";
-                p["text"] = mtmd_default_marker();
+                p["text"] = get_media_marker();
                 p.erase("input_audio");
 
             } else if (type == "video_url") {
@@ -1230,7 +1230,7 @@ json oaicompat_chat_params_parse(
                 // Replace with media markers (one per frame)
                 std::string markers;
                 for (int fi = 0; fi < video->n_frames; fi++) {
-                    markers += mtmd_default_marker();
+                    markers += get_media_marker();
                 }
 
                 p["type"] = "media_marker";
