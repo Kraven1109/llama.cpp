@@ -261,9 +261,17 @@ llama_tokens tokenize_mixed(const llama_vocab * vocab, const json & json_prompt,
 // if validate_utf8(text) == text.size(), then the whole text is valid utf8
 size_t validate_utf8(const std::string& text);
 
+// Video frame metadata for propagating temporal info to bitmap processing
+struct video_frame_meta {
+    int   file_idx;       // index into the out_files vector
+    int   frame_idx;      // 0-based frame index within the video
+    int   n_frames_total; // total frames in the video
+    float timestamp_sec;
+};
+
 // process mtmd prompt, return the server_tokens containing both text tokens and media chunks
 // if is_placeholder is true, the media chunk will be treated as placeholder for counting tokens; the output tokens are not usable for actual inference (e.g. for submitting a task to server_queue)
-server_tokens process_mtmd_prompt(mtmd_context * mctx, const std::string & prompt, const std::vector<raw_buffer> & files, bool is_placeholder = false);
+server_tokens process_mtmd_prompt(mtmd_context * mctx, const std::string & prompt, const std::vector<raw_buffer> & files, bool is_placeholder = false, const std::vector<video_frame_meta> & video_frames = {});
 
 /**
  * break the input "prompt" object into multiple prompt if needed, then tokenize them
@@ -313,7 +321,8 @@ json oaicompat_completion_params_parse(const json & body);
 json oaicompat_chat_params_parse(
     json & body, /* openai api json semantics */
     const server_chat_params & opt,
-    std::vector<raw_buffer> & out_files);
+    std::vector<raw_buffer> & out_files,
+    std::vector<video_frame_meta> & out_video_frames);
 
 // TODO: move it to server-task.cpp
 json format_embeddings_response_oaicompat(

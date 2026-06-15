@@ -166,6 +166,12 @@ MTMD_API void                  mtmd_bitmap_free       (mtmd_bitmap * bitmap);
 MTMD_API const char * mtmd_bitmap_get_id(const mtmd_bitmap * bitmap);
 MTMD_API void         mtmd_bitmap_set_id(mtmd_bitmap * bitmap, const char * id);
 
+// video frame metadata - set these before mtmd_tokenize() for video frames
+MTMD_API void         mtmd_bitmap_set_video_frame(mtmd_bitmap * bitmap, int frame_idx, int n_frames_total, float timestamp_sec);
+MTMD_API int          mtmd_bitmap_get_frame_idx     (const mtmd_bitmap * bitmap);
+MTMD_API int          mtmd_bitmap_get_n_frames_total(const mtmd_bitmap * bitmap);
+MTMD_API float        mtmd_bitmap_get_timestamp_sec (const mtmd_bitmap * bitmap);
+
 // mtmd_bitmap lazy
 //
 // this is a special bitmap that:
@@ -232,6 +238,10 @@ MTMD_API size_t       mtmd_image_tokens_get_n_tokens(const mtmd_image_tokens * i
 MTMD_API const char * mtmd_image_tokens_get_id      (const mtmd_image_tokens * image_tokens); // TODO: deprecate
 // number of temporal positions (equals to max(t,h,w) for M-RoPE; equals to n_tokens otherwise)
 MTMD_API llama_pos    mtmd_image_tokens_get_n_pos   (const mtmd_image_tokens * image_tokens); // TODO: deprecate
+
+// video frame info (frame_idx=0 means static image, >0 means video frame)
+MTMD_API int          mtmd_image_tokens_get_frame_idx     (const mtmd_image_tokens * image_tokens);
+MTMD_API int          mtmd_image_tokens_get_n_frames_total(const mtmd_image_tokens * image_tokens);
 
 DEPRECATED(MTMD_API size_t mtmd_image_tokens_get_nx(const mtmd_image_tokens * image_tokens),
            "use mtmd_image_tokens_get_decoder_pos() instead");

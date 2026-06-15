@@ -186,6 +186,28 @@ struct decode_embd_batch {
         }
     }
 
+    // M-RoPE for video frame (3D: temporal + spatial)
+    // temporal_id: frame index in video (0-based) mapped to temporal position
+    // For Qwen2.5-VL: pos layout is [temporal, height, width, unused]
+    void set_position_mrope_3d(llama_pos pos_0, int nx, int ny, int temporal_id, llama_seq_id seq_id) {
+        GGML_ASSERT(n_pos_per_embd == 4);
+        seq_id_0[0] = seq_id;
+        for (int y = 0; y < ny; y++) {
+            for (int x = 0; x < nx; x++) {
+                int i = y * nx + x;
+                pos[i                     ] = pos_0 + temporal_id; // temporal dimension
+                pos[i + batch.n_tokens    ] = pos_0 + y;           // height
+                pos[i + batch.n_tokens * 2] = pos_0 + x;           // width
+                pos[i + batch.n_tokens * 3] = 0;                   // unused
+            }
+        }
+        for (int i = 0; i < batch.n_tokens; i++) {
+            batch.n_seq_id[i] = 1;
+            batch.seq_id  [i] = seq_id_0.data();
+            batch.logits  [i] = false;
+        }
+    }
+
     // M-RoPE for audio
     void set_position_mrope_1d(llama_pos pos_0, llama_seq_id seq_id) {
         GGML_ASSERT(n_pos_per_embd == 4);

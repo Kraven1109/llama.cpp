@@ -35,6 +35,11 @@ struct mtmd_bitmap {
     std::string id; // optional user-defined id, for ex: can be set to image hash, useful for KV cache tracking
     bool is_audio = false; // true if the bitmap is audio
 
+    // Video frame info (0 = static image)
+    int   frame_idx      = 0;
+    float timestamp_sec  = 0.0f;
+    int   n_frames_total = 0; // total frames in the video this belongs to
+
     // lazy-loaded bitmap
     mtmd_bitmap_lazy_callback lazy_callback = nullptr;
     void * lazy_user_data = nullptr;
@@ -112,6 +117,11 @@ struct mtmd_image_tokens {
     clip_image_f32_batch batch_f32; // preprocessed image patches
     std::string id; // optional user-defined ID, useful for KV cache tracking
 
+    // Video temporal info
+    int   frame_idx      = 0;  // 0 = static image, 1+ = video frame index
+    float timestamp_sec   = 0.0f;
+    int   n_frames_total  = 0;  // total frames in the video (0 = not video)
+
     // true if one of entries in batch_f32 is a placeholder
     bool is_placeholder() const {
         for (const auto & entry : batch_f32.entries) {
@@ -134,7 +144,10 @@ struct mtmd_image_tokens {
             image_idx,
             n_temporal_merge,
             batch_f32.clone(),
-            id
+            id,
+            frame_idx,
+            timestamp_sec,
+            n_frames_total
         };
     }
 };
@@ -1204,6 +1217,11 @@ struct mtmd_tokenizer {
                 image_tokens->batch_f32 = std::move(batch_f32);
                 image_tokens->id = bitmaps[0]->id; // optional
 
+                // Propagate video frame info from bitmap
+                image_tokens->frame_idx      = bitmaps[0]->frame_idx;
+                image_tokens->timestamp_sec  = bitmaps[0]->timestamp_sec;
+                image_tokens->n_frames_total = bitmaps[0]->n_frames_total;
+
                 LOG_DBG("image_tokens->nx = %d\n", image_tokens->nx);
                 LOG_DBG("image_tokens->ny = %d\n", image_tokens->ny);
                 LOG_DBG("batch_f32 size = %d\n", (int)image_tokens->batch_f32.entries.size());
@@ -1755,6 +1773,24 @@ void mtmd_bitmap_set_id(mtmd_bitmap * bitmap, const char * id) {
     }
 }
 
+void mtmd_bitmap_set_video_frame(mtmd_bitmap * bitmap, int frame_idx, int n_frames_total, float timestamp_sec) {
+    bitmap->frame_idx      = frame_idx;
+    bitmap->n_frames_total = n_frames_total;
+    bitmap->timestamp_sec  = timestamp_sec;
+}
+
+int mtmd_bitmap_get_frame_idx(const mtmd_bitmap * bitmap) {
+    return bitmap->frame_idx;
+}
+
+int mtmd_bitmap_get_n_frames_total(const mtmd_bitmap * bitmap) {
+    return bitmap->n_frames_total;
+}
+
+float mtmd_bitmap_get_timestamp_sec(const mtmd_bitmap * bitmap) {
+    return bitmap->timestamp_sec;
+}
+
 mtmd_bitmap * mtmd_bitmap_init_lazy(mtmd_context * ctx,
                                     const char * id,
                                     void * user_data,
@@ -1896,7 +1932,11 @@ mtmd_decoder_pos mtmd_image_tokens_get_decoder_pos(const mtmd_image_tokens * ima
     switch (image_tokens->pos) {
         case MTMD_POS_TYPE_MROPE:
             {
+                if (image_tokens->n_frames_total > 0) {
+                    pos.t = pos_0 + image_tokens->frame_idx;
+                } else {
                 pos.t = pos_0;
+                }
                 pos.x = pos_0 + (i % image_tokens->nx);
                 pos.y = pos_0 + (i / image_tokens->nx);
                 pos.z = 0; // unused for now
@@ -1953,7 +1993,10 @@ const char * mtmd_image_tokens_get_id(const mtmd_image_tokens * image_tokens) {
 llama_pos mtmd_image_tokens_get_n_pos(const mtmd_image_tokens * image_tokens) {
     switch (image_tokens->pos) {
         case MTMD_POS_TYPE_MROPE:
-            return std::max(image_tokens->nx, image_tokens->ny);
+            {
+                llama_pos t = (image_tokens->n_frames_total > 0) ? image_tokens->n_frames_total : 1;
+                return std::max({t, (llama_pos)image_tokens->nx, (llama_pos)image_tokens->ny});
+            }
         case MTMD_POS_TYPE_NORMAL:
             return image_tokens->n_tokens();
         case MTMD_POS_TYPE_HUNYUANVL:
@@ -1964,6 +2007,15 @@ llama_pos mtmd_image_tokens_get_n_pos(const mtmd_image_tokens * image_tokens) {
             GGML_ABORT("invalid position type");
     }
 }
+
+int mtmd_image_tokens_get_frame_idx(const mtmd_image_tokens * image_tokens) {
+    return image_tokens->frame_idx;
+}
+
+int mtmd_image_tokens_get_n_frames_total(const mtmd_image_tokens * image_tokens) {
+    return image_tokens->n_frames_total;
+}
+
 
 // test function
 

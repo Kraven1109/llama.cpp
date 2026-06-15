@@ -430,6 +430,10 @@ static projector_type clip_projector_type_from_string(const std::string & str) {
 
 // RGB uint8 image
 struct clip_image_u8 {
+    // Video temporal info (0 = static image, >0 = video frame index)
+    int   frame_idx     = 0;
+    float timestamp_sec = 0.0f;
+
     clip_image_size get_size() const {
         return { nx, ny };
     }
